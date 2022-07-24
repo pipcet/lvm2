@@ -64,6 +64,8 @@ static int _vgmerge_single(struct cmd_context *cmd, const char *vg_name_to,
 	struct lv_list *lvl1, *lvl2;
 	int r = ECMD_FAILED;
 	int lock_vg_from_first = 0;
+	struct logical_volume *lv;
+	int poolmetadataspare = arg_int_value(cmd, poolmetadataspare_ARG, DEFAULT_POOL_METADATA_SPARE);
 
 	if (!strcmp(vg_name_to, vg_name_from)) {
 		log_error("Duplicate volume group name \"%s\"", vg_name_from);
@@ -90,6 +92,20 @@ static int _vgmerge_single(struct cmd_context *cmd, const char *vg_name_to,
 			unlock_and_release_vg(cmd, vg_to, vg_name_to);
 			return_ECMD_FAILED;
 		}
+	}
+
+	if (vg_from->pool_metadata_spare_lv &&
+	    vg_to->pool_metadata_spare_lv) {
+		if (vg_from->pool_metadata_spare_lv->le_count >
+		    vg_to->pool_metadata_spare_lv->le_count)
+			/* Preserve bigger pmspare from  VG_FROM */
+			lv = vg_to->pool_metadata_spare_lv;
+		else
+			lv = vg_from->pool_metadata_spare_lv;
+
+		log_debug_metadata("Removing pool metadata spare %s.", display_lvname(lv));
+		if (!lv_remove_single(cmd, lv, DONT_PROMPT, 0))
+				return_ECMD_FAILED;
 	}
 
 	if (!vgs_are_compatible(cmd, vg_from, vg_to))
@@ -170,6 +186,10 @@ static int _vgmerge_single(struct cmd_context *cmd, const char *vg_name_to,
 
 	/* Flag up that some PVs have moved from another VG */
 	vg_to->old_name = vg_from->name;
+
+        /* Check whether size of pmspare is big enough now for merged VG */
+	if (!handle_pool_metadata_spare(vg_to, 0, &vg_to->pvs, poolmetadataspare))
+		goto_bad;
 
 	/* store it on disks */
 	log_verbose("Writing out updated volume group");

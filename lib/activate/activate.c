@@ -413,7 +413,7 @@ int add_areas_line(struct dev_manager *dm, struct lv_segment *seg,
 {
         return 0;
 }
-int device_is_usable(struct device *dev, struct dev_usable_check_params check, int *is_lv)
+int device_is_usable(struct cmd_context *cmd, struct device *dev, struct dev_usable_check_params check, int *is_lv)
 {
         return 0;
 }
@@ -486,12 +486,20 @@ int library_version(char *version, size_t size)
 
 int driver_version(char *version, size_t size)
 {
+	static char _vsn[80] = { 0 };
+
 	if (!activation())
 		return 0;
 
 	log_very_verbose("Getting driver version");
 
-	return dm_driver_version(version, size);
+	if (!_vsn[0] &&
+	    !dm_driver_version(_vsn, sizeof(_vsn)))
+		return_0;
+
+	(void) dm_strncpy(version, _vsn, size);
+
+	return 1;
 }
 
 int target_version(const char *target_name, uint32_t *maj,
@@ -563,7 +571,7 @@ int module_present(struct cmd_context *cmd, const char *target_name)
 			    dm_sysfs_dir(), target_name);
 
 	if (i > 0) {
-		while (path[--i] != '/')  /* stop on dm_ */
+		while ((i > 0) && path[--i] != '/')  /* stop on dm_ */
 			if (path[i] == '-')
 				path[i] = '_'; /* replace '-' with '_' */
 
@@ -614,6 +622,15 @@ int target_present(struct cmd_context *cmd, const char *target_name,
 
 	return target_present_version(cmd, target_name, use_modprobe,
 				      &maj, &min, &patchlevel);
+}
+
+int get_device_list(const struct volume_group *vg, struct dm_list **devs,
+		    unsigned *devs_features)
+{
+	if (!activation())
+		return 0;
+
+	return dev_manager_get_device_list(NULL, devs, devs_features);
 }
 
 /*
@@ -1491,7 +1508,7 @@ int lvs_in_vg_opened(const struct volume_group *vg)
  */
 int raid4_is_supported(struct cmd_context *cmd, const struct segment_type *segtype)
 {
-	unsigned attrs;
+	unsigned attrs = 0;
 
 	if (segtype_is_raid4(segtype) &&
 	    (!segtype->ops->target_present ||
@@ -2374,6 +2391,7 @@ int lv_deactivate(struct cmd_context *cmd, const char *lvid_s, const struct logi
 	static const struct lv_activate_opts laopts = { .skip_in_use = 1 };
 	struct dm_list *snh;
 	int r = 0;
+	unsigned tmp_state;
 
 	if (!activation())
 		return 1;
@@ -2446,12 +2464,17 @@ int lv_deactivate(struct cmd_context *cmd, const char *lvid_s, const struct logi
 	}
 	critical_section_dec(cmd, "deactivated");
 
+	tmp_state = cmd->disable_dm_devs;
+	cmd->disable_dm_devs = 1;
+
 	if (!lv_info(cmd, lv, 0, &info, 0, 0) || info.exists) {
 		/* Turn into log_error, but we do not log error */
 		log_debug_activation("Deactivated volume is still %s present.",
 				     display_lvname(lv));
 		r = 0;
 	}
+
+	cmd->disable_dm_devs = tmp_state;
 out:
 
 	return r;
@@ -2740,7 +2763,10 @@ static int _component_cb(struct logical_volume *lv, void *data)
 	    (lv_is_thin_pool(lv) && pool_is_active(lv)))
 		return -1;
 
-	if (lv_is_active(lv)) {
+	/* External origin is activated through thinLV and uses -real suffix.
+	 * Note: for old clustered logic we would need to check for all thins */
+	if ((lv_is_external_origin(lv) && lv_info(lv->vg->cmd, lv, 1, NULL, 0, 0)) ||
+	    lv_is_active(lv)) {
 		if (!lv_is_component(lv) || lv_is_visible(lv))
 			return -1;	/* skip whole subtree */
 

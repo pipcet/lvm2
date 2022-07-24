@@ -122,7 +122,7 @@ cp $DF df2
 
 # vgcreate from existing pvs, already in df
 
-vgcreate $vg ${REAL_DEVICES[@]}
+vgcreate $vg "${REAL_DEVICES[@]}"
 
 vgremove $vg
 rm $DF
@@ -130,7 +130,7 @@ rm $DF
 # vgcreate from existing pvs, adding to df
 
 touch $DF
-vgcreate $vg ${REAL_DEVICES[@]}
+vgcreate $vg "${REAL_DEVICES[@]}"
 
 grep IDNAME $DF > df.ids
 grep IDNAME df2 > df2.ids
@@ -242,7 +242,7 @@ grep $dev2 $DF
 rm $DF
 wipe_all
 
-vgcreate $vg ${REAL_DEVICES[@]}
+vgcreate $vg "${REAL_DEVICES[@]}"
 rm $DF
 touch $DF
 
@@ -423,7 +423,7 @@ sed "s/$pvid1/badpvid/" "$DF.orig" |tee $DF
 not grep $pvid1 $DF
 grep $did1 $DF
 
-lvmdevices --check 2>&1|tee out
+not lvmdevices --check 2>&1|tee out
 grep $dev1 out
 grep badpvid out
 grep $pvid1 out
@@ -493,7 +493,7 @@ rm $DF
 d1=$(basename $dev1)
 d3=$(basename $dev3)
 sed "s/$d1/$d3/" "$DF.orig" |tee $DF
-lvmdevices --check 2>&1 |tee out
+not lvmdevices --check 2>&1 |tee out
 grep $dev1 out
 
 lvmdevices --update
@@ -515,7 +515,7 @@ sed "s/$d1/tmp/" "$DF.orig" |tee ${DF}_1
 sed "s/$d2/$d1/" "${DF}_1" |tee ${DF}_2
 sed "s/tmp/$d2/" "${DF}_2" |tee $DF
 rm ${DF}_1 ${DF}_2
-lvmdevices --check 2>&1 |tee out
+not lvmdevices --check 2>&1 |tee out
 grep $dev1 out
 grep $dev2 out
 
@@ -536,7 +536,7 @@ rm $DF
 d1=$(basename $dev1)
 d3=$(basename $dev3)
 sed "s/$d1/$d3/" "$DF.orig" |tee $DF
-lvmdevices --check 2>&1 |tee out
+not lvmdevices --check 2>&1 |tee out
 grep $dev1 out
 
 pvs -o+uuid,deviceid | grep $vg |tee out

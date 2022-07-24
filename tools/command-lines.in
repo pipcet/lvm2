@@ -204,7 +204,7 @@
 #
 OO_ALL: --commandprofile String, --config String, --debug,
 --driverloaded Bool, --help, --nolocking, --lockopt String, --longhelp, --profile String, --quiet,
---verbose, --version, --yes, --test, --devicesfile String, --devices PV
+--verbose, --version, --yes, --test, --devicesfile String, --devices PV, --nohints --journal String
 
 #
 # options for pvs, lvs, vgs, fullreport
@@ -243,6 +243,7 @@ OO_LVCHANGE_META: --addtag Tag, --deltag Tag,
 --setautoactivation Bool, --errorwhenfull Bool, --discards Discards, --zero Bool,
 --cachemode CacheMode, --cachepolicy String, --cachesettings String,
 --minrecoveryrate SizeKB, --maxrecoveryrate SizeKB,
+--vdosettings String,
 --writebehind Number, --writemostly WriteMostlyPV, --persistent n
 
 # It's unfortunate that activate needs to be optionally allowed here;
@@ -341,7 +342,8 @@ OO_LVCONVERT_CACHE: --cachemetadataformat CacheMetadataFormat,
 --cachesettings String, --zero Bool
 
 OO_LVCONVERT_VDO: --metadataprofile String, --readahead Readahead,
---compression Bool, --deduplication Bool, --zero Bool
+--compression Bool, --deduplication Bool, --vdosettings String,
+--zero Bool
 
 OO_LVCONVERT: --alloc Alloc, --background, --force, --noudevsync
 
@@ -839,7 +841,7 @@ OO_LVCREATE_POOL: --poolmetadatasize SizeMB, --poolmetadataspare Bool, --chunksi
 
 OO_LVCREATE_THINPOOL: --discards Discards, --errorwhenfull Bool
 
-OO_LVCREATE_VDO: --compression Bool, --deduplication Bool
+OO_LVCREATE_VDO: --compression Bool, --deduplication Bool, --vdosettings String
 ---
 
 lvcreate --type error --size SizeMB VG
@@ -1359,10 +1361,10 @@ OO: --aligned, --all, --binary, --colon, --columns,
 --configreport ConfigReport, --foreign, --history, --ignorelockingfailure,
 --logonly, --maps, --noheadings,
 --nosuffix, --options String, --sort String, --readonly,
---reportformat ReportFmt, --segments, --select String, --separator String,
+--segments, --select String, --separator String,
 --shared, --unbuffered, --units Units
 OP: VG|LV|Tag ...
-IO: --partial, --ignoreskippedcluster
+IO: --partial, --ignoreskippedcluster, --reportformat ReportFmt
 ID: lvdisplay_general
 
 ---
@@ -1434,11 +1436,13 @@ OO: --deviceidtype String
 ID: lvmdevices_edit
 DESC: Add a device to the devices file.
 
-lvmdevices --deldev PV
+lvmdevices --deldev PV|String
+OO: --deviceidtype String
 ID: lvmdevices_edit
 DESC: Remove a device from the devices file.
 
 lvmdevices --addpvid String
+OO: --deviceidtype String
 ID: lvmdevices_edit
 DESC: Find the device with the given PVID and add it to the devices file.
 
@@ -1589,10 +1593,10 @@ pvdisplay
 OO: --aligned, --all, --binary, --colon, --columns, --configreport ConfigReport,
 --foreign, --ignorelockingfailure,
 --logonly, --maps, --noheadings, --nosuffix, --options String,
---readonly, --reportformat ReportFmt, --select String, --separator String, --shared,
+--readonly, --select String, --separator String, --shared,
 --short, --sort String, --unbuffered, --units Units
 OP: PV|Tag ...
-IO: --ignoreskippedcluster
+IO: --ignoreskippedcluster, --reportformat ReportFmt
 ID: pvdisplay_general
 
 ---
@@ -1633,11 +1637,38 @@ DESC: Display PV information.
 
 pvscan --cache_long
 OO: --ignorelockingfailure, --reportformat ReportFmt,
---activate ay, --major Number, --minor Number, --noudevsync
+--major Number, --minor Number, --noudevsync
 OP: PV|String ...
 IO: --background
 ID: pvscan_cache
-DESC: Autoactivate a VG when all PVs are online.
+DESC: Record that a PV is online or offline.
+
+pvscan --cache_long --activate ay
+OO: --ignorelockingfailure, --reportformat ReportFmt,
+--major Number, --minor Number, --noudevsync, --autoactivation String
+OP: PV|String ...
+IO: --background
+ID: pvscan_cache
+DESC: Record that a PV is online and autoactivate the VG if complete.
+
+pvscan --cache_long --listvg PV
+OO: --ignorelockingfailure, --checkcomplete, --vgonline, --udevoutput,
+--autoactivation String
+ID: pvscan_cache
+DESC: Record that a PV is online and list the VG using the PV.
+
+pvscan --cache_long --listlvs PV
+OO: --ignorelockingfailure, --checkcomplete, --vgonline
+ID: pvscan_cache
+DESC: Record that a PV is online and list LVs using the PV.
+
+pvscan --listlvs PV
+ID: pvscan_cache
+DESC: List LVs using the PV.
+
+pvscan --listvg PV
+ID: pvscan_cache
+DESC: List the VG using the PV.
 
 ---
 
@@ -1720,7 +1751,8 @@ DESC: Start or stop processing LV conversions.
 
 vgchange --activate Active
 OO: --activationmode ActivationMode, --ignoreactivationskip, --partial, --sysinit,
---readonly, --ignorelockingfailure, --monitor Bool, --poll Bool, OO_VGCHANGE
+--readonly, --ignorelockingfailure, --monitor Bool, --poll Bool,
+--autoactivation String, OO_VGCHANGE
 OP: VG|Tag|Select ...
 IO: --ignoreskippedcluster
 ID: vgchange_activate
@@ -1782,10 +1814,10 @@ vgdisplay
 OO: --activevolumegroups, --aligned, --binary, --colon, --columns,
 --configreport ConfigReport, --foreign, --ignorelockingfailure,
 --logonly, --noheadings, --nosuffix,
---options String, --readonly, --reportformat ReportFmt, --select String,
+--options String, --readonly, --select String,
 --shared, --short, --separator String, --sort String, --unbuffered, --units Units
 OP: VG|Tag ...
-IO: --partial, --ignoreskippedcluster
+IO: --partial, --ignoreskippedcluster, --reportformat ReportFmt
 ID: vgdisplay_general
 
 ---
@@ -1847,7 +1879,7 @@ DESC: Add devices from all accessible VGs to the devices file.
 ---
 
 vgmerge VG VG
-OO: --autobackup Bool, --list
+OO: --autobackup Bool, --list, --poolmetadataspare Bool
 ID: vgmerge_general
 
 ---
@@ -1912,7 +1944,7 @@ ID: vgscan_general
 
 ---
 
-OO_VGSPLIT: --autobackup Bool
+OO_VGSPLIT: --autobackup Bool, --poolmetadataspare Bool
 
 # used only when the destination VG is new
 OO_VGSPLIT_NEW: --alloc Alloc,

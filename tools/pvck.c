@@ -40,7 +40,7 @@ struct settings {
 	uint64_t device_size;      /* bytes */
 	uint64_t data_offset;      /* bytes, start of data (pe_start) */
 	uint32_t seqno;
-	struct id pvid;
+	struct id pv_id;
 
 	int mda_num;               /* 1 or 2 for first or second mda */
 	char *backup_file;
@@ -343,14 +343,15 @@ static uint64_t mda2_size_from_offset(struct device *dev, uint64_t mda2_offset)
 }
 
 struct devicefile {
-	char path[PATH_MAX];
 	int fd;
+	char path[0];
 };
 
-static struct devicefile *get_devicefile(const char *path)
+static struct devicefile *get_devicefile(struct cmd_context *cmd, const char *path)
 {
 	struct stat sb;
 	struct devicefile *def;
+	size_t len;
 
 	if (stat(path, &sb))
 		return_NULL;
@@ -358,18 +359,14 @@ static struct devicefile *get_devicefile(const char *path)
 	if ((sb.st_mode & S_IFMT) != S_IFREG)
 		return_NULL;
 
-	if (!(def = malloc(sizeof(struct devicefile))))
+	len = strlen(path) + 1;
+	if (!(def = dm_pool_alloc(cmd->mem, sizeof(struct devicefile) + len)))
 		return_NULL;
 
-	if (dm_snprintf(def->path, PATH_MAX, "%s", path) < 0) {
-		free(def);
-		return_NULL;
-	}
+	memcpy(def->path, path, len);
 
-	if ((def->fd = open(path, O_RDONLY)) < 0) {
-		free(def);
+	if ((def->fd = open(path, O_RDONLY)) < 0)
 		return_NULL;
-	}
 
 	return def;
 }
@@ -381,6 +378,9 @@ static bool _read_bytes(struct device *dev, struct devicefile *def, uint64_t sta
 
 	if (dev)
 		return dev_read_bytes(dev, start, len, data);
+
+	if (!def)
+		return false;
 
 	off = lseek(def->fd, start, SEEK_SET);
 	if (off != start)
@@ -901,7 +901,7 @@ static int _dump_current_text(struct device *dev, struct devicefile *def,
 	int ri = rlocn_index; /* 0 or 1 */
 	int bad = 0;
 
-	if (!(meta_buf = zalloc(meta_size))) {
+	if (!(meta_buf = malloc(meta_size + 1))) {
 		log_print("CHECK: mda_header_%d.raw_locn[%d] no mem for metadata text size %llu", mn, ri,
 			  (unsigned long long)meta_size);
 		return 0;
@@ -947,6 +947,7 @@ static int _dump_current_text(struct device *dev, struct devicefile *def,
 		}
 	}
 
+	meta_buf[meta_size] = 0;
 	crc = calc_crc(INITIAL_CRC, (uint8_t *)meta_buf, meta_size);
 	if (crc != meta_checksum) {
 		log_print("CHECK: metadata text at %llu crc does not match mda_header_%d.raw_locn[%d].checksum",
@@ -1774,8 +1775,7 @@ static int _get_one_setting(struct cmd_context *cmd, struct settings *set, char 
 	}
 
 	if (!strncmp(key, "backup_file", strlen("backup_file"))) {
-		free(set->backup_file);
-		if ((set->backup_file = strdup(val)))
+		if ((set->backup_file = dm_pool_strdup(cmd->mem, val)))
 			return 1;
 		return 0;
 	}
@@ -1824,10 +1824,10 @@ static int _get_one_setting(struct cmd_context *cmd, struct settings *set, char 
 
 	if (!strncmp(key, "pv_uuid", strlen("pv_uuid"))) {
 		if (strchr(val, '-') && (strlen(val) == 32)) {
-			memcpy(&set->pvid, val, 32);
+			memcpy(&set->pv_id, val, 32);
 			set->pvid_set = 1;
 			return 1;
-		} else if (id_read_format_try(&set->pvid, val)) {
+		} else if (id_read_format_try(&set->pv_id, val)) {
 			set->pvid_set = 1;
 			return 1;
 		} else {
@@ -1975,18 +1975,14 @@ static int _get_pv_info_from_metadata(struct cmd_context *cmd, struct settings *
 				     uint64_t *device_size_sectors,
 				     uint64_t *pe_start_sectors)
 {
-	int8_t pvid_cur[ID_LEN+1];  /* found in existing pv_header */
-	int8_t pvid_set[ID_LEN+1];  /* set by user in --settings */
-	int8_t pvid_use[ID_LEN+1];  /* the pvid chosen to use */
-	int pvid_cur_valid = 0;     /* pvid_cur is valid */
-	int pvid_use_valid = 0;     /* pvid_use is valid */
+	char pvid_cur[ID_LEN + 1] = { 0 };  /* found in existing pv_header */
+	char pvid_set[ID_LEN + 1] = { 0 };  /* set by user in --settings */
+	char pvid_use[ID_LEN + 1] = { 0 };  /* the pvid chosen to use */
+	int pvid_cur_valid = 0;             /* pvid_cur is valid */
+	int pvid_use_valid = 0;             /* pvid_use is valid */
 	struct dm_config_tree *cft = NULL;
 	struct volume_group *vg = NULL;
 	struct pv_list *pvl;
-
-	memset(pvid_cur, 0, sizeof(pvid_cur));
-	memset(pvid_set, 0, sizeof(pvid_set));
-	memset(pvid_use, 0, sizeof(pvid_use));
 
 	/*
 	 * Check if there's a valid existing PV UUID at the expected location.
@@ -2000,14 +1996,14 @@ static int _get_pv_info_from_metadata(struct cmd_context *cmd, struct settings *
 	}
 
 	if (set->pvid_set) {
-		memcpy(&pvid_set, &set->pvid, ID_LEN);
+		memcpy(&pvid_set, &set->pv_id, ID_LEN);
 		memcpy(&pvid_use, &pvid_set, ID_LEN);
 		pvid_use_valid = 1;
 	}
 
 	if (pvid_cur_valid && set->pvid_set && memcmp(&pvid_cur, &pvid_set, ID_LEN)) {
 		log_warn("WARNING: existing PV UUID %s does not match pv_uuid setting %s.",
-			 (char *)&pvid_cur, (char *)&pvid_set);
+			 pvid_cur, pvid_set);
 
 		memcpy(&pvid_use, &pvid_set, ID_LEN);
 		pvid_use_valid = 1;
@@ -2045,7 +2041,7 @@ static int _get_pv_info_from_metadata(struct cmd_context *cmd, struct settings *
 		}
 	} else {
 		dm_list_iterate_items(pvl, &vg->pvs) {
-			if (id_equal(&pvl->pv->id, (struct id *)&pvid_use))
+			if (!memcmp(&pvl->pv->id.uuid, &pvid_use, ID_LEN))
 				goto copy_pv;
 		}
 	}
@@ -2059,9 +2055,9 @@ static int _get_pv_info_from_metadata(struct cmd_context *cmd, struct settings *
 	 * . the metadata has no PV with a device name hint matching this device
 	 */
 	if (set->pvid_set)
-		log_error("PV UUID %s not found in metadata file.", (char *)&pvid_set);
+		log_error("PV UUID %s not found in metadata file.", pvid_set);
 	else if (pvid_cur_valid)
-		log_error("PV UUID %s in existing pv_header not found in metadata file.", (char *)&pvid_cur);
+		log_error("PV UUID %s in existing pv_header not found in metadata file.", pvid_cur);
 	else if (!pvid_use_valid)
 		log_error("PV name %s not found in metadata file.", dev_name(dev));
 
@@ -2220,7 +2216,7 @@ static int _repair_pv_header(struct cmd_context *cmd, const char *repair,
 			     uint64_t labelsector, struct device *dev)
 {
 	char head_buf[512];
-	int8_t pvid[ID_LEN+1];
+	char pvid[ID_LEN + 1] __attribute__((aligned(8))) = { 0 };
 	struct device *dev_with_pvid = NULL;
 	struct label_header *lh;
 	struct pv_header *pvh;
@@ -2237,8 +2233,6 @@ static int _repair_pv_header(struct cmd_context *cmd, const char *repair,
 	int mda_count = 0;
 	int found_label = 0;
 	int di;
-
-	memset(&pvid, 0, ID_LEN+1);
 
 	lh_offset = labelsector * 512; /* from start of disk */
 
@@ -2350,7 +2344,7 @@ static int _repair_pv_header(struct cmd_context *cmd, const char *repair,
 	if (set->device_size_set && set->pvid_set && set->data_offset_set && !mf->filename) {
 		device_size = set->device_size;
 		pe_start_sectors = set->data_offset >> SECTOR_SHIFT;
-		memcpy(&pvid, &set->pvid, ID_LEN);
+		memcpy(pvid, &set->pv_id, ID_LEN);
 
 		if (get_size && (get_size != device_size)) {
 			log_warn("WARNING: device_size setting %llu bytes does not match device size %llu bytes.",
@@ -2382,7 +2376,7 @@ static int _repair_pv_header(struct cmd_context *cmd, const char *repair,
 	 * dev_size and pe_start from the metadata to use in the pv_header.
 	 */
 	if (!_get_pv_info_from_metadata(cmd, set, dev, pvh, found_label,
-					mf->text_buf, mf->text_size, (char *)&pvid,
+					mf->text_buf, mf->text_size, pvid,
 					&device_size_sectors, &pe_start_sectors))
 		goto fail;
 
@@ -2396,13 +2390,13 @@ static int _repair_pv_header(struct cmd_context *cmd, const char *repair,
 	 * Read all devs to verify the pvid that will be written does not exist
 	 * on another device.
 	 */
-	if (!label_scan_for_pvid(cmd, (char *)&pvid, &dev_with_pvid)) {
+	if (!label_scan_for_pvid(cmd, pvid, &dev_with_pvid)) {
 		log_error("Failed to scan devices to check PV UUID.");
 		goto fail;
 	}
 
 	if (dev_with_pvid && (dev_with_pvid != dev)) {
-		log_error("Cannot use PV UUID %s which exists on %s", (char *)&pvid, dev_name(dev_with_pvid));
+		log_error("Cannot use PV UUID %s which exists on %s", pvid, dev_name(dev_with_pvid));
 		goto fail;
 	}
 
@@ -2470,7 +2464,7 @@ static int _repair_pv_header(struct cmd_context *cmd, const char *repair,
 	 */
 
 	log_print("Writing label_header.crc 0x%08x pv_header uuid %s device_size %llu",
-		  head_crc, (char *)&pvid, (unsigned long long)device_size);
+		  head_crc, pvid, (unsigned long long)device_size);
 
 	log_print("Writing data_offset %llu mda1_offset %llu mda1_size %llu mda2_offset %llu mda2_size %llu",
 		  (unsigned long long)data_offset,
@@ -2965,7 +2959,7 @@ static int _read_metadata_file(struct cmd_context *cmd, struct metadata_file *mf
 		goto out;
 	}
 
-	if (!(text_buf = zalloc(text_size + 1)))
+	if (!(text_buf = malloc(text_size + 1)))
 		goto_out;
 
 	rv = read(fd, text_buf, text_size);
@@ -2974,8 +2968,7 @@ static int _read_metadata_file(struct cmd_context *cmd, struct metadata_file *mf
 		free(text_buf);
 		goto out;
 	}
-
-	text_size += 1; /* null terminating byte */
+	text_buf[text_size++] = 0; /* null terminating byte */
 
 	if (close(fd))
 		stack;
@@ -3063,7 +3056,7 @@ int pvck(struct cmd_context *cmd, int argc, char **argv)
 			return ECMD_FAILED;
 		}
 		if (S_ISREG(sb.st_mode))
-			def = get_devicefile(pv_name);
+			def = get_devicefile(cmd, pv_name);
 		else if (S_ISBLK(sb.st_mode)) {
 			if (!setup_device(cmd, pv_name)) {
 				log_error("Failed to set up device %s.", pv_name);
@@ -3078,14 +3071,14 @@ int pvck(struct cmd_context *cmd, int argc, char **argv)
 	}
 
 	if (!_get_settings(cmd, &set))
-		return ECMD_FAILED;
+		return_ECMD_FAILED;
 
 	if (arg_is_set(cmd, file_ARG) && (arg_is_set(cmd, repairtype_ARG) || arg_is_set(cmd, repair_ARG))) {
 		if (!(mf.filename = arg_str_value(cmd, file_ARG, NULL)))
-			return ECMD_FAILED;
+			return_ECMD_FAILED;
 
 		if (!_read_metadata_file(cmd, &mf))
-			return ECMD_FAILED;
+			return_ECMD_FAILED;
 	}
 
 	label_scan_setup_bcache();
@@ -3111,7 +3104,7 @@ int pvck(struct cmd_context *cmd, int argc, char **argv)
 		 * reads in the filters and by _read_bytes for other disk structs.
 		 */
 		if (!dev_read_bytes(dev, 0, 4096, buf)) {
-	        	log_error("Failed to read the first 4096 bytes of device %s.", dev_name(dev));
+			log_error("Failed to read the first 4096 bytes of device %s.", dev_name(dev));
 			return ECMD_FAILED;
 		}
 
@@ -3145,9 +3138,8 @@ int pvck(struct cmd_context *cmd, int argc, char **argv)
 		} else
 			log_error("Unknown dump value.");
 
-		free(def);
 		if (!ret)
-			return ECMD_FAILED;
+			return_ECMD_FAILED;
 		return ECMD_PROCESSED;
 	}
 
@@ -3166,7 +3158,7 @@ int pvck(struct cmd_context *cmd, int argc, char **argv)
 			log_error("Unknown repair value.");
 
 		if (!ret)
-			return ECMD_FAILED;
+			return_ECMD_FAILED;
 		return ECMD_PROCESSED;
 	}
 
@@ -3176,10 +3168,10 @@ int pvck(struct cmd_context *cmd, int argc, char **argv)
 		/* repair is a combination of repairtype pv_header+metadata */
 
 		if (!_repair_pv_header(cmd, "pv_header", &set, &mf, labelsector, dev))
-			return ECMD_FAILED;
+			return_ECMD_FAILED;
 
 		if (!_repair_metadata(cmd, "metadata", &set, &mf, labelsector, dev))
-			return ECMD_FAILED;
+			return_ECMD_FAILED;
 
 		return ECMD_PROCESSED;
 	}
@@ -3189,10 +3181,11 @@ int pvck(struct cmd_context *cmd, int argc, char **argv)
 	 * but this is here to preserve the historical output.
 	 */
 
-	if (argc == 1)
-		setup_device(cmd, argv[0]);
-	else if (!setup_devices(cmd))
-		return ECMD_FAILED;
+	if (argc == 1) {
+		if (!setup_device(cmd, argv[0]))
+			return_ECMD_FAILED;
+	} else if (!setup_devices(cmd))
+		return_ECMD_FAILED;
 
 	for (i = 0; i < argc; i++) {
 		pv_name = argv[i];
@@ -3207,6 +3200,6 @@ int pvck(struct cmd_context *cmd, int argc, char **argv)
 	}
 
 	if (bad)
-		return ECMD_FAILED;
+		return_ECMD_FAILED;
 	return ECMD_PROCESSED;
 }

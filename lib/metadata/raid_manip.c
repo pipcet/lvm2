@@ -46,7 +46,7 @@ static int _check_restriping(uint32_t new_stripes, struct logical_volume *lv)
  */
 static int _reshape_is_supported(struct cmd_context *cmd, const struct segment_type *segtype)
 {
-	unsigned attrs;
+	unsigned attrs = 0;
 
 	if (!segtype->ops->target_present ||
             !segtype->ops->target_present(cmd, NULL, &attrs) ||
@@ -65,7 +65,7 @@ static int _reshape_is_supported(struct cmd_context *cmd, const struct segment_t
 static int _rebuild_with_emptymeta_is_supported(struct cmd_context *cmd,
 						const struct segment_type *segtype)
 {
-	unsigned attrs;
+	unsigned attrs = 0;
 
 	if (!segtype->ops->target_present ||
             !segtype->ops->target_present(cmd, NULL, &attrs) ||
@@ -6963,7 +6963,7 @@ try_again:
 	 */
 	if (!_raid_extract_images(lv, force,
 				  raid_seg->area_count - match_count,
-				  (partial_segment_removed || !dm_list_size(remove_pvs)) ?
+				  (partial_segment_removed || dm_list_empty(remove_pvs)) ?
 				  &lv->vg->pvs : remove_pvs, 0,
 				  &old_lvs, &old_lvs)) {
 		log_error("Failed to remove the specified images from %s.",

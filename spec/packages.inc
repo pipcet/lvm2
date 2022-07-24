@@ -61,6 +61,9 @@ fi
 %{_sbindir}/pvresize
 %{_sbindir}/pvs
 %{_sbindir}/pvscan
+%if %{have_with vdo}
+%{_sbindir}/lvm_import_vdo
+%endif
 %{_sbindir}/vgcfgbackup
 %{_sbindir}/vgcfgrestore
 %{_sbindir}/vgchange
@@ -85,6 +88,7 @@ fi
  %{_sbindir}/lvmpolld
 %endif
 %{_mandir}/man5/lvm.conf.5.gz
+%{_mandir}/man7/lvmautoactivation.7.gz
 %{_mandir}/man7/lvmsystemid.7.gz
 %{_mandir}/man7/lvmreport.7.gz
 %{_mandir}/man7/lvmraid.7.gz
@@ -97,9 +101,6 @@ fi
 %{_mandir}/man8/lvm-config.8.gz
 %{_mandir}/man8/lvm-dumpconfig.8.gz
 %{_mandir}/man8/lvm.8.gz
-%if %{enable_systemd}
- %{_mandir}/man8/lvm2-activation-generator.8.gz
-%endif
 %{_mandir}/man8/lvmconfig.8.gz
 %{_mandir}/man8/lvmdevices.8.gz
 %{_mandir}/man8/lvmdiskscan.8.gz
@@ -122,6 +123,9 @@ fi
 %{_mandir}/man8/pvresize.8.gz
 %{_mandir}/man8/pvs.8.gz
 %{_mandir}/man8/pvscan.8.gz
+%if %{have_with vdo}
+%{_mandir}/man8/lvm_import_vdo.8.gz
+%endif
 %{_mandir}/man8/vgcfgbackup.8.gz
 %{_mandir}/man8/vgcfgrestore.8.gz
 %{_mandir}/man8/vgchange.8.gz
@@ -157,7 +161,7 @@ fi
 %endif
 %if %{enable_udev}
  %{_udevdir}/11-dm-lvm.rules
- %{_udevdir}/69-dm-lvm-metad.rules
+ %{_udevdir}/69-dm-lvm.rules
 %endif
 %dir %{_sysconfdir}/lvm
 %ghost %{_sysconfdir}/lvm/cache/.cache
@@ -183,8 +187,6 @@ fi
  %{_tmpfilesdir}/%{name}.conf
  %{_unitdir}/blk-availability.service
  %{_unitdir}/lvm2-monitor.service
- %{_unitdir}/lvm2-pvscan@.service
- %attr(555, -, -) %{_prefix}/lib/systemd/system-generators/lvm2-activation-generator
  %if %{have_service lvmpolld}
   %{_unitdir}/lvm2-lvmpolld.service
   %{_unitdir}/lvm2-lvmpolld.socket

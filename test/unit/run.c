@@ -125,7 +125,8 @@ static void _print_path_delta(FILE *stream,
 			fprintf(stream, "\n");
 	}
 
-	len = common_prefix * 2 + (new[new_len - 1].e - new[new_len - 1].b);
+	len = (new_len > 0) ? common_prefix * 2 + (new[new_len - 1].e - new[new_len - 1].b) : 0;
+
 	fprintf(stream, "  ");
 	for (d = len; d < 60; d++)
 		fprintf(stream, ".");
@@ -198,6 +199,7 @@ static void _run_test(struct test_details *t, bool use_colour, unsigned *passed,
 
 		(*passed)++;
 		fprintf(stderr, "%s[     OK]%s\n", green(use_colour), normal(use_colour));
+		/* coverity[leaked_storage]  fixture released by fixture_exit */
 	}
 }
 
@@ -238,7 +240,7 @@ static unsigned _filter(const char *pattern, struct test_details **tests, unsign
 	}
 
 	for (i = 0; i < nr; i++)
-		if (!regexec(&rx, tests[i]->path, 0, NULL, 0))
+		if (tests[i] && !regexec(&rx, tests[i]->path, 0, NULL, 0))
 			tests[found++] = tests[i];
 
 	regfree(&rx);
@@ -269,6 +271,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "out of memory\n");
 		exit(1);
 	}
+	memset(t_array, 0, sizeof(*t_array) * nr_tests);
 
 	i = 0;
 	dm_list_iterate_items (ts, &suites)

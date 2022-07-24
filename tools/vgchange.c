@@ -14,10 +14,13 @@
  */
 
 #include "tools.h"
+#include "lib/device/device_id.h"
+#include "lib/label/hints.h"
 
 struct vgchange_params {
 	int lock_start_count;
 	unsigned int lock_start_sanlock : 1;
+	unsigned int vg_complete_to_activate : 1;
 };
 
 /*
@@ -194,10 +197,11 @@ int vgchange_background_polling(struct cmd_context *cmd, struct volume_group *vg
 }
 
 int vgchange_activate(struct cmd_context *cmd, struct volume_group *vg,
-		      activation_change_t activate)
+		      activation_change_t activate, int vg_complete_to_activate)
 {
 	int lv_open, active, monitored = 0, r = 1;
 	const struct lv_list *lvl;
+	struct pv_list *pvl;
 	int do_activate = is_change_activating(activate);
 
 	/*
@@ -216,6 +220,15 @@ int vgchange_activate(struct cmd_context *cmd, struct volume_group *vg,
 	if ((activate == CHANGE_AAY) && (vg->status & NOAUTOACTIVATE)) {
 		log_debug("Autoactivation is disabled for VG %s.", vg->name);
 		return 1;
+	}
+
+	if (do_activate && vg_complete_to_activate) {
+		dm_list_iterate_items(pvl, &vg->pvs) {
+			if (!pvl->pv->dev) {
+				log_print("VG %s is incomplete.", vg->name);
+				return 1;
+			}
+		}
 	}
 
 	/*
@@ -412,11 +425,14 @@ static int _vgchange_uuid(struct cmd_context *cmd __attribute__((unused)),
 			  struct volume_group *vg)
 {
 	struct lv_list *lvl;
+	struct id old_vg_id;
 
 	if (lvs_in_vg_activated(vg)) {
 		log_error("Volume group has active logical volumes");
 		return 0;
 	}
+
+	memcpy(&old_vg_id, &vg->id, ID_LEN);
 
 	if (!id_create(&vg->id)) {
 		log_error("Failed to generate new random UUID for VG %s.",
@@ -427,6 +443,12 @@ static int _vgchange_uuid(struct cmd_context *cmd __attribute__((unused)),
 	dm_list_iterate_items(lvl, &vg->lvs) {
 		memcpy(&lvl->lv->lvid, &vg->id, sizeof(vg->id));
 	}
+
+	/*
+	 * If any LVs in this VG have PVs stacked on them, then
+	 * update the device_id of the stacked PV.
+	 */
+	device_id_update_vg_uuid(cmd, vg, &old_vg_id);
 
 	return 1;
 }
@@ -637,6 +659,7 @@ static int _vgchange_single(struct cmd_context *cmd, const char *vg_name,
 			    struct volume_group *vg,
 			    struct processing_handle *handle)
 {
+	struct vgchange_params *vp = (struct vgchange_params *)handle->custom_handle;
 	int ret = ECMD_PROCESSED;
 	unsigned i;
 	activation_change_t activate;
@@ -691,7 +714,7 @@ static int _vgchange_single(struct cmd_context *cmd, const char *vg_name,
 
 	if (arg_is_set(cmd, activate_ARG)) {
 		activate = (activation_change_t) arg_uint_value(cmd, activate_ARG, 0);
-		if (!vgchange_activate(cmd, vg, activate))
+		if (!vgchange_activate(cmd, vg, activate, vp->vg_complete_to_activate))
 			return_ECMD_FAILED;
 	} else if (arg_is_set(cmd, refresh_ARG)) {
 		/* refreshes the visible LVs (which starts polling) */
@@ -712,9 +735,143 @@ static int _vgchange_single(struct cmd_context *cmd, const char *vg_name,
 	return ret;
 }
 
+static int _vgchange_autoactivation_setup(struct cmd_context *cmd,
+					  struct vgchange_params *vp,
+					  int *skip_command,
+					  const char **vgname_ret,
+					  uint32_t *flags)
+{
+	const char *aa;
+	char *vgname = NULL;
+	int vg_locked = 0;
+	int found_none = 0, found_all = 0, found_incomplete = 0;
+
+	if (!(aa = arg_str_value(cmd, autoactivation_ARG, NULL)))
+		return_0;
+
+	if (strcmp(aa, "event")) {
+		log_print("Skip vgchange for unknown autoactivation value.");
+		*skip_command = 1;
+		return 1;
+	}
+
+	if (!find_config_tree_bool(cmd, global_event_activation_CFG, NULL)) {
+		log_print("Skip vgchange for event and event_activation=0.");
+		*skip_command = 1;
+		return 1;
+	}
+
+	vp->vg_complete_to_activate = 1;
+	cmd->use_hints = 0;
+
+	/*
+	 * Add an option to skip the pvs_online optimization? e.g.
+	 * "online_skip" in --autoactivation / auto_activation_settings
+	 *
+	 * if (online_skip)
+	 *	return 1;
+	 */
+
+	/* reads devices file, does not populate dev-cache */
+	if (!setup_devices_for_online_autoactivation(cmd))
+		return_0;
+
+	get_single_vgname_cmd_arg(cmd, NULL, &vgname);
+
+	/*
+	 * Lock the VG before scanning the PVs so _vg_read can avoid the normal
+	 * lock_vol+rescan (READ_WITHOUT_LOCK avoids the normal lock_vol and
+	 * can_use_one_scan avoids the normal rescan.)  If this early lock_vol
+	 * fails, continue and use the normal lock_vol in _vg_read.
+	 */
+	if (vgname) {
+		if (!lock_vol(cmd, vgname, LCK_VG_WRITE, NULL)) {
+			log_debug("Failed early VG locking for autoactivation.");
+		} else {
+			*flags |= READ_WITHOUT_LOCK;
+			cmd->can_use_one_scan = 1;
+			vg_locked = 1;
+		}
+	}
+
+	/*
+	 * Perform label_scan on PVs that are online (per /run/lvm files)
+	 * for the given VG (or when no VG name is given, all online PVs.)
+	 * If this fails, the caller will do a normal process_each_vg without
+	 * optimizations (which will do a full label_scan.)
+	 */
+	if (!label_scan_vg_online(cmd, vgname, &found_none, &found_all, &found_incomplete)) {
+		log_print("PVs online error%s%s, using all devices.", vgname ? " for VG " : "", vgname ?: "");
+		goto bad;
+	}
+
+	/*
+	 * Not the expected usage, activate any VGs that are complete based on
+	 * pvs_online.  Only online pvs are used.
+	 */
+	if (!vgname) {
+		*flags |= PROCESS_SKIP_SCAN;
+		return 1;
+	}
+
+	/*
+	 * The expected and optimal usage, which is the purpose of
+	 * this function.  We expect online files to be found for
+	 * all PVs because the udev rule calls
+	 * vgchange -aay --autoactivation event <vgname>
+	 * only after all PVs for vgname are found online.
+	 */
+	if (found_all) {
+		*flags |= PROCESS_SKIP_SCAN;
+		*vgname_ret = vgname;
+		return 1;
+	}
+
+	/*
+	 * Not expected usage, no online pvs for the vgname were found.  The
+	 * caller will fall back to process_each doing a full label_scan to
+	 * look for the VG.  (No optimization used.)
+	 */
+	if (found_none) {
+		log_print("PVs online not found for VG %s, using all devices.", vgname);
+		goto bad;
+	}
+
+	/*
+	 * Not expected usage, only some online pvs for the vgname were found.
+	 * The caller will fall back to process_each doing a full label_scan to
+	 * look for all PVs in the VG.  (No optimization used.)
+	 */
+	if (found_incomplete) {
+		log_print("PVs online incomplete for VG %s, using all devicess.", vgname);
+		goto bad;
+	}
+
+	/*
+	 * Shouldn't happen, the caller will fall back to standard
+	 * process_each.  (No optimization used.)
+	 */
+	log_print("PVs online unknown for VG %s, using all devices.", vgname);
+
+ bad:
+	/*
+	 * The online scanning optimization didn't work, so undo the vg
+	 * locking optimization before falling back to normal processing.
+	 */
+	if (vg_locked) {
+		unlock_vg(cmd, NULL, vgname);
+		*flags &= ~READ_WITHOUT_LOCK;
+		cmd->can_use_one_scan = 0;
+	}
+	return 1;
+
+}
+
 int vgchange(struct cmd_context *cmd, int argc, char **argv)
 {
+	struct vgchange_params vp = { 0 };
 	struct processing_handle *handle;
+	const char *vgname = NULL;
 	uint32_t flags = 0;
 	int ret;
 
@@ -799,6 +956,17 @@ int vgchange(struct cmd_context *cmd, int argc, char **argv)
 	if (!update || !update_partial_unsafe)
 		cmd->handles_missing_pvs = 1;
 
+	if (noupdate)
+		cmd->ignore_device_name_mismatch = 1;
+
+	/*
+	 * If the devices file includes PVs stacked on LVs, then
+	 * vgchange --uuid may need to update the devices file.
+	 * No PV-on-LV stacked is done without scan_lvs set.
+	 */
+	if (arg_is_set(cmd, uuid_ARG) && cmd->scan_lvs)
+		cmd->edit_devices_file = 1;
+
 	/*
 	 * Include foreign VGs that contain active LVs.
 	 * That shouldn't happen in general, but if it does by some
@@ -816,6 +984,25 @@ int vgchange(struct cmd_context *cmd, int argc, char **argv)
 			cmd->lockd_vg_enforce_sh = 1;
 	}
 
+	if (arg_is_set(cmd, autoactivation_ARG)) {
+		int skip_command = 0;
+		if (!_vgchange_autoactivation_setup(cmd, &vp, &skip_command, &vgname, &flags))
+			return ECMD_FAILED;
+		if (skip_command)
+			return ECMD_PROCESSED;
+	}
+
+	/*
+	 * Do not use udev for device listing or device info because
+	 * vgchange --monitor y is called during boot when udev is being
+	 * initialized and is not yet ready to be used.
+	 */
+	if (arg_is_set(cmd, monitor_ARG) &&
+	    arg_int_value(cmd, monitor_ARG, DEFAULT_DMEVENTD_MONITOR)) {
+		init_obtain_device_list_from_udev(0);
+		init_external_device_info_source(DEV_EXT_NONE);
+	}
+
 	if (update)
 		flags |= READ_FOR_UPDATE;
 	else if (arg_is_set(cmd, activate_ARG))
@@ -826,7 +1013,9 @@ int vgchange(struct cmd_context *cmd, int argc, char **argv)
 		return ECMD_FAILED;
 	}
 
-	ret = process_each_vg(cmd, argc, argv, NULL, NULL, flags, 0, handle, &_vgchange_single);
+	handle->custom_handle = &vp;
+
+	ret = process_each_vg(cmd, argc, argv, vgname, NULL, flags, 0, handle, &_vgchange_single);
 
 	destroy_processing_handle(cmd, handle);
 	return ret;

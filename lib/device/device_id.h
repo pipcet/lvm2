@@ -32,13 +32,18 @@ int device_id_add(struct cmd_context *cmd, struct device *dev, const char *pvid,
 void device_id_pvremove(struct cmd_context *cmd, struct device *dev);
 void device_ids_match(struct cmd_context *cmd);
 int device_ids_match_dev(struct cmd_context *cmd, struct device *dev);
+void device_ids_match_device_list(struct cmd_context *cmd);
 void device_ids_validate(struct cmd_context *cmd, struct dm_list *scanned_devs, int *device_ids_invalid, int noupdate);
 int device_ids_version_unchanged(struct cmd_context *cmd);
 void device_ids_find_renamed_devs(struct cmd_context *cmd, struct dm_list *dev_list, int *search_count, int noupdate);
 const char *device_id_system_read(struct cmd_context *cmd, struct device *dev, uint16_t idtype);
+void device_id_update_vg_uuid(struct cmd_context *cmd, struct volume_group *vg, struct id *old_vg_id);
 
+struct dev_use *get_du_for_devno(struct cmd_context *cmd, dev_t devno);
 struct dev_use *get_du_for_dev(struct cmd_context *cmd, struct device *dev);
 struct dev_use *get_du_for_pvid(struct cmd_context *cmd, const char *pvid);
+struct dev_use *get_du_for_devname(struct cmd_context *cmd, const char *devname);
+struct dev_use *get_du_for_device_id(struct cmd_context *cmd, uint16_t idtype, const char *idname);
 
 char *devices_file_version(void);
 int devices_file_exists(struct cmd_context *cmd);
@@ -51,5 +56,9 @@ void devices_file_init(struct cmd_context *cmd);
 void devices_file_exit(struct cmd_context *cmd);
 
 void unlink_searched_devnames(struct cmd_context *cmd);
+
+int read_sys_block(struct cmd_context *cmd, struct device *dev, const char *suffix, char *sysbuf, int sysbufsize);
+
+int dev_has_mpath_uuid(struct cmd_context *cmd, struct device *dev, const char **idname_out);
 
 #endif

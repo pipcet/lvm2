@@ -119,6 +119,7 @@ static int read_cluster_name(char *clustername)
 			log_error(close_error_msg, fd);
 		return rv;
 	}
+	clustername[rv] = 0;
 
 	n = strstr(clustername, "\n");
 	if (n)
@@ -790,17 +791,18 @@ int lm_is_running_dlm(void)
 
 int lm_refresh_lv_start_dlm(struct action *act)
 {
-	char path[PATH_MAX];
+	char path[PATH_MAX] = { 0 };
 	char command[DLMC_RUN_COMMAND_LEN];
 	char run_uuid[DLMC_RUN_UUID_LEN];
 	char *p, *vgname, *lvname;
 	int rv;
 
 	/* split /dev/vgname/lvname into vgname and lvname strings */
-	strncpy(path, act->path, strlen(act->path));
+	strncpy(path, act->path, PATH_MAX-1);
 
 	/* skip past dev */
-	p = strchr(path + 1, '/');
+	if (!(p = strchr(path + 1, '/')))
+		return -EINVAL;
 
 	/* skip past slashes */
 	while (*p == '/')

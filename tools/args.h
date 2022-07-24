@@ -46,8 +46,12 @@ arg(addtag_ARG, '\0', "addtag", tag_VAL, ARG_GROUPABLE, 0,
 
 arg(adddev_ARG, '\0', "adddev", pv_VAL, 0, 0,
     "Add a device to the devices file.\n")
-arg(deldev_ARG, '\0', "deldev", pv_VAL, 0, 0,
-    "Remove a device from the devices file.\n")
+
+arg(deldev_ARG, '\0', "deldev", string_VAL, 0, 0,
+    "Remove a device from the devices file.\n"
+    "When used alone, --deldev specifies a device name.\n"
+    "When used with --deviceidtype, --deldev specifies a device id.\n")
+
 arg(addpvid_ARG, '\0', "addpvid", string_VAL, 0, 0,
     "Find a device with the PVID and add the device to the devices file.\n")
 arg(delpvid_ARG, '\0', "delpvid", string_VAL, 0, 0,
@@ -86,6 +90,12 @@ arg(atversion_ARG, '\0', "atversion", string_VAL, 0, 0,
     "to display a configuration that a certain LVM version understands and\n"
     "which does not contain any newer settings for which LVM would\n"
     "issue a warning message when checking the configuration.\n")
+
+arg(autoactivation_ARG, '\0', "autoactivation", string_VAL, 0, 0,
+    "Specify if autoactivation is being used from an event.\n"
+    "This allows the command to apply settings that are specific\n"
+    "to event activation, such as device scanning optimizations\n"
+    "using pvs_online files created by event-based pvscans.\n")
 
 arg(setautoactivation_ARG, '\0', "setautoactivation", bool_VAL, 0, 0,
     "Set the autoactivation property on a VG or LV.\n"
@@ -153,7 +163,8 @@ arg(cachesize_ARG, '\0', "cachesize", sizemb_VAL, 0, 0,
     "The size of cache to use.\n")
 
 arg(check_ARG, '\0', "check", 0, 0, 0,
-    "Check the content of the devices file.\n")
+    "Checks the content of the devices file.\n"
+    "Reports incorrect device names or PVIDs for entries.\n")
 
 arg(commandprofile_ARG, '\0', "commandprofile", string_VAL, 0, 0,
     "The command profile to use for command configuration.\n"
@@ -234,8 +245,9 @@ arg(deviceidtype_ARG, '\0', "deviceidtype", string_VAL, 0, 0,
     "then it will override the default type that lvm would use.\n")
 
 arg(devices_ARG, '\0', "devices", pv_VAL, ARG_GROUPABLE, 0,
-    "Devices that the command can use. This option can be repeated\n"
-    "or accepts a comma separated list of devices. This overrides\n"
+    "Restricts the devices that are visible and accessible to the command.\n"
+    "Devices not listed will appear to be missing. This option can be\n"
+    "repeated, or accepts a comma separated list of devices. This overrides\n"
     "the devices file.\n")
 
 arg(devicesfile_ARG, '\0', "devicesfile", string_VAL, 0, 0,
@@ -323,11 +335,32 @@ arg(ignoreunsupported_ARG, '\0', "ignoreunsupported", 0, 0, 0,
 arg(importdevices_ARG, '\0', "importdevices", 0, 0, 0,
     "Add devices to the devices file.\n")
 
+arg(journal_ARG, '\0', "journal", string_VAL, 0, 0,
+    "Record information in the systemd journal.\n"
+    "This information is in addition to information\n"
+    "enabled by the lvm.conf log/journal setting.\n"
+    "command: record information about the command.\n"
+    "output: record the default command output.\n"
+    "debug: record full command debugging.\n")
+
 arg(labelsector_ARG, '\0', "labelsector", number_VAL, 0, 0,
     "By default the PV is labelled with an LVM2 identifier in its second\n"
     "sector (sector 1). This lets you use a different sector near the\n"
     "start of the disk (between 0 and 3 inclusive - see LABEL_SCAN_SECTORS\n"
     "in the source). Use with care.\n")
+
+arg(listlvs_ARG, '\0', "listlvs", 0, 0, 0,
+    "Print a list of LVs that use the device.\n")
+
+arg(listvg_ARG, '\0', "listvg", 0, 0, 0,
+    "Print the VG that uses the device.\n")
+
+arg(checkcomplete_ARG, '\0', "checkcomplete", 0, 0, 0,
+    "Check if all the devices used by a VG or LV are present,\n"
+    "and print \"complete\" or \"incomplete\" for each listed\n"
+    "VG or LV.  This option is used as a part of event-based\n"
+    "autoactivation, so pvscan will do nothing if this option\n"
+    "is set and event_activation=0 in the config settings.\n")
 
 arg(lockopt_ARG, '\0', "lockopt", string_VAL, 0, 0,
     "Used to pass options for special cases to lvmlockd.\n"
@@ -460,13 +493,19 @@ arg(noheadings_ARG, '\0', "noheadings", 0, 0, 0,
     "Suppress the headings line that is normally the first line of output.\n"
     "Useful if grepping the output.\n")
 
+arg(nohints_ARG, '\0', "nohints", 0, 0, 0,
+    "Do not use the hints file to locate devices for PVs. A command may read\n"
+    "more devices to find PVs when hints are not used. The command will still\n"
+    "perform standard hint file invalidation where appropriate.\n")
+
 arg(nohistory_ARG, '\0', "nohistory", 0, 0, 0,
     "Do not record history of LVs being removed.\n"
     "This has no effect unless the configuration setting\n"
     "metadata/record_lvs_history is enabled.\n")
 
 arg(nolocking_ARG, '\0', "nolocking", 0, 0, 0,
-    "Disable locking.\n")
+    "Disable locking. Use with caution, concurrent commands may produce\n"
+    "incorrect results.\n")
 
 arg(norestorefile_ARG, '\0', "norestorefile", 0, 0, 0,
     "In conjunction with --uuid, this allows a uuid to be specified\n"
@@ -811,6 +850,9 @@ arg(type_ARG, '\0', "type", segtype_VAL, 0, 0,
     "(e.g. --stripes, --mirrors, --snapshot, --virtualsize, --thin, --cache, --vdo).\n"
     "Use inferred types with care because it can lead to unexpected results.\n")
 
+arg(udevoutput_ARG, '\0', "udevoutput", 0, 0, 0,
+    "Command output is modified to be imported from a udev rule.\n")
+
 arg(unbuffered_ARG, '\0', "unbuffered", 0, 0, 0,
     "Produce output immediately without sorting or aligning the columns properly.\n")
 
@@ -826,12 +868,13 @@ arg(cachepolicy_ARG, '\0', "cachepolicy", string_VAL, 0, 0,
     "See \\fBlvmcache\\fP(7) for more information.\n")
 
 arg(cachesettings_ARG, '\0', "cachesettings", string_VAL, ARG_GROUPABLE, 0,
-    "Specifies tunable values for a cache LV in \"Key = Value\" form.\n"
-    "Repeat this option to specify multiple values.\n"
-    "(The default values should usually be adequate.)\n"
-    "The special string value \\fBdefault\\fP switches\n"
-    "settings back to their default kernel values and removes\n"
-    "them from the list of settings stored in LVM metadata.\n"
+    "Specifies tunable kernel options for dm-cache or dm-writecache LVs.\n"
+    "Use the form 'option=value' or 'option1=value option2=value', or\n"
+    "repeat --cachesettings for each option being set.\n"
+    "These settings override the default kernel behaviors which are\n"
+    "usually adequate. To remove cachesettings and revert to the default\n"
+    "kernel behaviors, use --cachesettings 'default' for dm-cache or\n"
+    "an empty string --cachesettings '' for dm-writecache.\n"
     "See \\fBlvmcache\\fP(7) for more information.\n")
 
 arg(unconfigured_ARG, '\0', "unconfigured", 0, 0, 0,
@@ -869,6 +912,15 @@ arg(vdopool_ARG, '\0', "vdopool", lv_VAL, 0, 0,
     "The name of a VDO pool LV.\n"
     "See \\fBlvmvdo\\fP(7) for more information about VDO usage.\n")
 
+arg(vdosettings_ARG, '\0', "vdosettings", string_VAL, ARG_GROUPABLE, 0,
+    "Specifies tunable VDO options for VDO LVs.\n"
+    "Use the form 'option=value' or 'option1=value option2=value', or\n"
+    "repeat --vdosettings for each option being set.\n"
+    "These settings override the default VDO behaviors.\n"
+    "To remove vdosettings and revert to the default\n"
+    "VDO behaviors, use --vdosettings 'default'.\n"
+    "See \\fBlvmvdo\\fP(7) for more information.\n")
+
 arg(version_ARG, '\0', "version", 0, 0, 0,
     "Display version information.\n")
 
@@ -886,6 +938,10 @@ arg(vgmetadatacopies_ARG, '\0', "vgmetadatacopies", vgmetadatacopies_VAL, 0, 0,
     "metadataignore flags.\n"
     "\\fBall\\fP causes LVM to first clear the metadataignore flags on\n"
     "all PVs, and then to become unmanaged.\n")
+
+arg(vgonline_ARG, '\0', "vgonline", 0, 0, 0,
+    "The first command to see a complete VG will report it uniquely.\n"
+    "Other commands to see the complete VG will report it differently.\n")
 
 arg(withsummary_ARG, '\0', "withsummary", 0, 0, 0,
     "Display a one line comment for each configuration node.\n")

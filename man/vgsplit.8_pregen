@@ -70,6 +70,8 @@ Common options for command:
 .hy
 ]
 .br
+[    \fB--poolmetadataspare\fP \fBy\fP|\fBn\fP ]
+.br
 [    \fB--\fP[\fBvg\fP]\fBmetadatacopies\fP \fBall\fP|\fBunmanaged\fP|\fINumber\fP ]
 .ad b
 .RE
@@ -100,9 +102,13 @@ Common options for lvm:
 .br
 [    \fB--driverloaded\fP \fBy\fP|\fBn\fP ]
 .br
+[    \fB--journal\fP \fIString\fP ]
+.br
 [    \fB--lockopt\fP \fIString\fP ]
 .br
 [    \fB--longhelp\fP ]
+.br
+[    \fB--nohints\fP ]
 .br
 [    \fB--nolocking\fP ]
 .br
@@ -169,8 +175,9 @@ messages sent to the log file and/or syslog (if configured).
 .HP
 \fB--devices\fP \fIPV\fP
 .br
-Devices that the command can use. This option can be repeated
-or accepts a comma separated list of devices. This overrides
+Restricts the devices that are visible and accessible to the command.
+Devices not listed will appear to be missing. This option can be
+repeated, or accepts a comma separated list of devices. This overrides
 the devices file.
 .
 .HP
@@ -192,6 +199,16 @@ For testing and debugging.
 \fB-h\fP|\fB--help\fP
 .br
 Display help text.
+.
+.HP
+\fB--journal\fP \fIString\fP
+.br
+Record information in the systemd journal.
+This information is in addition to information
+enabled by the lvm.conf log/journal setting.
+command: record information about the command.
+output: record the default command output.
+debug: record full command debugging.
 .
 .HP
 \fB--lockopt\fP \fIString\fP
@@ -230,9 +247,24 @@ Specifies the type of on-disk metadata to use.
 Move only PVs used by the named LV.
 .
 .HP
+\fB--nohints\fP
+.br
+Do not use the hints file to locate devices for PVs. A command may read
+more devices to find PVs when hints are not used. The command will still
+perform standard hint file invalidation where appropriate.
+.
+.HP
 \fB--nolocking\fP
 .br
-Disable locking.
+Disable locking. Use with caution, concurrent commands may produce
+incorrect results.
+.
+.HP
+\fB--poolmetadataspare\fP \fBy\fP|\fBn\fP
+.br
+Enable or disable the automatic creation and management of a
+spare pool metadata LV in the VG. A spare metadata LV is reserved
+space that can be used when repairing a pool.
 .
 .HP
 \fB--profile\fP \fIString\fP

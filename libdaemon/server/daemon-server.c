@@ -18,6 +18,7 @@
 
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h> /* help musl C */
 #include <pthread.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -326,7 +327,7 @@ static void _remove_lockfile(const char *file)
 static void _daemonise(daemon_state s)
 {
 	int child_status;
-	int fd;
+	int fd, ffd;
 	pid_t pid;
 	struct rlimit rlim;
 	struct timeval tval;
@@ -394,20 +395,22 @@ static void _daemonise(daemon_state s)
 
 	/* Switch to sysconf(_SC_OPEN_MAX) ?? */
 	if (getrlimit(RLIMIT_NOFILE, &rlim) < 0)
-		fd = 256; /* just have to guess */
+		ffd = 256; /* just have to guess */
 	else
-		fd = rlim.rlim_cur;
+		ffd = rlim.rlim_cur;
 
-	for (--fd; fd > STDERR_FILENO; fd--) {
+	for (--ffd; ffd > STDERR_FILENO; ffd--) {
 #ifdef __linux__
 		/* Do not close fds preloaded by systemd! */
-		if (_systemd_activation && fd == SD_FD_SOCKET_SERVER)
+		if (_systemd_activation && ffd == SD_FD_SOCKET_SERVER)
 			continue;
 #endif
-		(void) close(fd);
+		(void) close(ffd);
 	}
 
 	setsid();
+
+	/* coverity[leaked_handle] 'fd' handle is not leaking */
 }
 
 response daemon_reply_simple(const char *id, ...)

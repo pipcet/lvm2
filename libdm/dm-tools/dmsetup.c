@@ -2446,6 +2446,10 @@ static int _status(CMD_ARGS)
 	if (_switches[NOFLUSH_ARG] && !dm_task_no_flush(dmt))
 		goto_out;
 
+	if (!strcmp(cmd->name, "measure") &&
+	    !dm_task_ima_measurement(dmt))
+		goto_out;
+
 	if (!_task_run(dmt))
 		goto_out;
 
@@ -5842,12 +5846,12 @@ static int _stats_report(CMD_ARGS)
 	if (_switches[ALL_PROGRAMS_ARG])
 		_program_id = "";
 
-	if (_switches[VERBOSE_ARG] && !strcmp(subcommand, "list"))
+	if (_switches[VERBOSE_ARG] && subcommand && !strcmp(subcommand, "list"))
 		_statstype |= (DM_STATS_WALK_ALL
 			       | DM_STATS_WALK_SKIP_SINGLE_AREA);
 
 	/* suppress duplicates unless the user has requested all regions */
-	if (!strcmp(subcommand, "report") && !objtype_args)
+	if (subcommand && !objtype_args && !strcmp(subcommand, "report"))
 		/* suppress duplicate rows of output */
 		_statstype |= (DM_STATS_WALK_ALL
 			       | DM_STATS_WALK_SKIP_SINGLE_AREA);
@@ -6255,6 +6259,7 @@ static struct command _dmsetup_commands[] = {
 	{"reload", "<device> [<table>|<table_file>]", 0, 2, 0, 0, _load},
 	{"wipe_table", "[-f|--force] [--noflush] [--nolockfs] <device>...", 0, -1, 2, 0, _error_device},
 	{"rename", "<device> [--setuuid] <new_name_or_uuid>", 1, 2, 0, 0, _rename},
+	{"measure", "[<device>...]", 0, -1, 2, 0, _status},
 	{"message", "<device> <sector> <message>", 2, -1, 0, 0, _message},
 	{"ls", "[--target <target_type>] [--exec <command>] [-o <options>] [--tree]", 0, 0, 0, 0, _ls},
 	{"info", "[<device>...]", 0, -1, 1, 0, _info},
@@ -6426,9 +6431,10 @@ static const struct command *_find_command(const struct command *commands,
 {
 	int i;
 
-	for (i = 0; commands[i].name; i++)
-		if (!strcmp(commands[i].name, name))
-			return commands + i;
+	if (name)
+		for (i = 0; commands[i].name; i++)
+			if (!strcmp(commands[i].name, name))
+				return commands + i;
 
 	return NULL;
 }
@@ -6679,7 +6685,7 @@ static int _process_losetup_switches(const char *base, int *argcp, char ***argvp
 	};
 #endif
 
-	optarg = 0;
+	optarg = (char*) "";
 	optind = OPTIND_INIT;
 	while ((c = GETOPTLONG_FN(*argcp, *argvp, "ade:fo:v",
 				  long_options, NULL)) != -1 ) {
@@ -6762,6 +6768,8 @@ static int _process_losetup_switches(const char *base, int *argcp, char ***argvp
 	if (!_table ||
 	    !_loop_table(_table, (size_t) LOOP_TABLE_SIZE, loop_file, device_name, offset)) {
 		log_error("Could not build device-mapper table for %s.", (*argvp)[0]);
+		free(loop_file);
+		free(_table);
 		free(device_name);
 		return 0;
 	}
@@ -6770,6 +6778,7 @@ static int _process_losetup_switches(const char *base, int *argcp, char ***argvp
 	_command = "create";
 	(*argvp)[0] = device_name ;
 	*argcp = 1;
+	free(loop_file);
 
 	return 1;
 }
@@ -6972,7 +6981,7 @@ static int _process_switches(int *argcp, char ***argvp, const char *dev_dir)
 		return r;
 	}
 
-	optarg = 0;
+	optarg = (char*) "";
 	optind = OPTIND_INIT;
 	while ((ind = -1, c = GETOPTLONG_FN(*argcp, *argvp, "cCfG:hj:m:M:no:O:rS:u:U:vy",
 					    long_options, NULL)) != -1) {

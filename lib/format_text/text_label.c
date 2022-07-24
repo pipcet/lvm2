@@ -327,6 +327,9 @@ static int _read_mda_header_and_metadata(const struct format_type *fmt,
 {
 	struct mda_context *mdac = (struct mda_context *) mda->metadata_locn;
 	struct mda_header *mdah;
+	int retries = 0;
+
+ retry:
 
 	if (!(mdah = raw_read_mda_header(fmt, &mdac->area, (mda->mda_num == 1), 0, bad_fields))) {
 		log_warn("WARNING: bad metadata header on %s at %llu.",
@@ -354,6 +357,38 @@ static int _read_mda_header_and_metadata(const struct format_type *fmt,
 		if (vgsummary->zero_offset)
 			return 1;
 
+		/*
+		 * This code is used by label_scan to get a summary of the
+		 * VG metadata that will be properly read later by vg_read.
+		 * The initial read of this device during label_scan
+		 * populates bcache with the first 128K of data from the
+		 * device.  That block of data contains the mda_header
+		 * (at 4k) but will often not include the metadata text,
+		 * which is often located further into the metadata area
+		 * (beyond the 128K block saved in bcache.)
+		 * So read_metadata_location_summary will usually get the
+		 * mda_header from bcache which was read initially, and
+		 * then it will often need to do a new disk read to get
+		 * the actual metadata text that the mda_header points to.
+		 * Since there is no locking around label_scan, it's
+		 * possible (but very rare) that the entire metadata area
+		 * can be rewritten by other commands between the time that
+		 * this command read the mda_header and the time that it
+		 * reads the metadata text.  This means the expected metadata
+		 * text isn't found, and an error is returned here.
+		 * To handle this, invalidate all data in bcache for this
+		 * device and reread the mda_header and metadata text back to
+		 * back, so inconsistency is less likely (without locking
+		 * there's no guarantee, e.g. if the command is blocked
+		 * somehow between the two reads.)
+		 */
+		if (!retries) {
+			log_print("Retrying metadata scan.");
+			retries++;
+			dev_invalidate(mdac->area.dev);
+			goto retry;
+		}
+
 		log_warn("WARNING: bad metadata text on %s in mda%d",
 			 dev_name(mdac->area.dev), mda->mda_num);
 		*bad_fields |= BAD_MDA_TEXT;
@@ -374,6 +409,8 @@ static int _text_read(struct cmd_context *cmd, struct labeller *labeller, struct
 		      uint64_t label_sector, int *is_duplicate)
 {
 	struct lvmcache_vgsummary vgsummary;
+	char pvid[ID_LEN + 1] __attribute__((aligned(8))) = { 0 };
+	char vgid[ID_LEN + 1] __attribute__((aligned(8))) = { 0 };
 	struct lvmcache_info *info;
 	const struct format_type *fmt = labeller->fmt;
 	struct label_header *lh = (struct label_header *) label_buf;
@@ -396,6 +433,9 @@ static int _text_read(struct cmd_context *cmd, struct labeller *labeller, struct
 	 */
 	pvhdr = (struct pv_header *) ((char *) label_buf + xlate32(lh->offset_xl));
 
+	memcpy(pvid, &pvhdr->pv_uuid, ID_LEN);
+	strncpy(vgid, FMT_TEXT_ORPHAN_VG_NAME, ID_LEN);
+
 	/*
 	 * FIXME: stop adding the device to lvmcache initially as an orphan
 	 * (and then moving it later) and instead just add it when we know the
@@ -410,9 +450,9 @@ static int _text_read(struct cmd_context *cmd, struct labeller *labeller, struct
 	 *
 	 * Other reasons for lvmcache_add to return NULL are internal errors.
 	 */
-	if (!(info = lvmcache_add(cmd, labeller, (char *)pvhdr->pv_uuid, dev, label_sector,
-				  FMT_TEXT_ORPHAN_VG_NAME,
-				  FMT_TEXT_ORPHAN_VG_NAME, 0, is_duplicate)))
+	if (!(info = lvmcache_add(cmd, labeller, pvid, dev, label_sector,
+				  vgid,
+				  vgid, 0, is_duplicate)))
 		return_0;
 
 	lvmcache_set_device_size(info, xlate64(pvhdr->device_size_xl));
@@ -460,8 +500,9 @@ static int _text_read(struct cmd_context *cmd, struct labeller *labeller, struct
 	if (!(ext_version = xlate32(pvhdr_ext->version)))
 		goto scan_mdas;
 
-	log_debug_metadata("%s: PV header extension version " FMTu32 " found",
-			   dev_name(dev), ext_version);
+	if (ext_version != PV_HEADER_EXTENSION_VSN)
+		log_debug_metadata("Found pv_header_extension version " FMTu32 " on %s",
+				   ext_version, dev_name(dev));
 
 	/* Extension version */
 	lvmcache_set_ext_version(info, xlate32(pvhdr_ext->version));
@@ -522,7 +563,7 @@ static int _text_read(struct cmd_context *cmd, struct labeller *labeller, struct
 				bad_mda_count++;
 			} else {
 				/* The normal success path */
-				log_debug("Scanned %s mda1 seqno %u", dev_name(dev), vgsummary.seqno);
+				log_debug("Found metadata seqno %u in mda1 on %s", vgsummary.seqno, dev_name(dev));
 				good_mda_count++;
 			}
 		}
@@ -572,7 +613,7 @@ static int _text_read(struct cmd_context *cmd, struct labeller *labeller, struct
 				bad_mda_count++;
 			} else {
 				/* The normal success path */
-				log_debug("Scanned %s mda2 seqno %u", dev_name(dev), vgsummary.seqno);
+				log_debug("Found metadata seqno %u in mda2 on %s", vgsummary.seqno, dev_name(dev));
 				good_mda_count++;
 			}
 		}

@@ -74,6 +74,8 @@ void unlink_searched_devnames(struct cmd_context *cmd)
 
 	if (unlink(_searched_file))
 		log_debug("unlink %s errno %d", _searched_file, errno);
+	else
+		log_debug("unlink %s", _searched_file);
 }
 
 static int _searched_devnames_exists(struct cmd_context *cmd)
@@ -180,7 +182,7 @@ void free_dids(struct dm_list *ids)
 	}
 }
 
-static int _read_sys_block(struct cmd_context *cmd, struct device *dev, const char *suffix, char *sysbuf, int sysbufsize)
+int read_sys_block(struct cmd_context *cmd, struct device *dev, const char *suffix, char *sysbuf, int sysbufsize)
 {
 	char path[PATH_MAX];
 	dev_t devt = dev->dev;
@@ -241,12 +243,12 @@ static int _dm_uuid_has_prefix(char *sysbuf, const char *prefix)
 }
 
 /* the dm uuid uses the wwid of the underlying dev */
-static int _dev_has_mpath_uuid(struct cmd_context *cmd, struct device *dev, const char **idname_out)
+int dev_has_mpath_uuid(struct cmd_context *cmd, struct device *dev, const char **idname_out)
 {
 	char sysbuf[PATH_MAX] = { 0 };
 	const char *idname;
 
-	if (!_read_sys_block(cmd, dev, "dm/uuid", sysbuf, sizeof(sysbuf)))
+	if (!read_sys_block(cmd, dev, "dm/uuid", sysbuf, sizeof(sysbuf)))
 		return 0;
 
 	if (!_dm_uuid_has_prefix(sysbuf, "mpath-"))
@@ -265,7 +267,7 @@ static int _dev_has_crypt_uuid(struct cmd_context *cmd, struct device *dev, cons
 	char sysbuf[PATH_MAX] = { 0 };
 	const char *idname;
 
-	if (!_read_sys_block(cmd, dev, "dm/uuid", sysbuf, sizeof(sysbuf)))
+	if (!read_sys_block(cmd, dev, "dm/uuid", sysbuf, sizeof(sysbuf)))
 		return 0;
 
 	if (!_dm_uuid_has_prefix(sysbuf, "CRYPT-"))
@@ -284,7 +286,7 @@ static int _dev_has_lvmlv_uuid(struct cmd_context *cmd, struct device *dev, cons
 	char sysbuf[PATH_MAX] = { 0 };
 	const char *idname;
 
-	if (!_read_sys_block(cmd, dev, "dm/uuid", sysbuf, sizeof(sysbuf)))
+	if (!read_sys_block(cmd, dev, "dm/uuid", sysbuf, sizeof(sysbuf)))
 		return 0;
 
 	if (!_dm_uuid_has_prefix(sysbuf, "LVM-"))
@@ -302,40 +304,59 @@ const char *device_id_system_read(struct cmd_context *cmd, struct device *dev, u
 {
 	char sysbuf[PATH_MAX] = { 0 };
 	const char *idname = NULL;
+	int i;
 
 	if (idtype == DEV_ID_TYPE_SYS_WWID) {
-		_read_sys_block(cmd, dev, "device/wwid", sysbuf, sizeof(sysbuf));
+		read_sys_block(cmd, dev, "device/wwid", sysbuf, sizeof(sysbuf));
 
 		if (!sysbuf[0])
-			_read_sys_block(cmd, dev, "wwid", sysbuf, sizeof(sysbuf));
+			read_sys_block(cmd, dev, "wwid", sysbuf, sizeof(sysbuf));
+
+		/* qemu wwid begins "t10.ATA     QEMU HARDDISK ..." */
+		if (strstr(sysbuf, "QEMU HARDDISK"))
+			sysbuf[0] = '\0';
 	}
 
 	else if (idtype == DEV_ID_TYPE_SYS_SERIAL)
-		_read_sys_block(cmd, dev, "device/serial", sysbuf, sizeof(sysbuf));
+		read_sys_block(cmd, dev, "device/serial", sysbuf, sizeof(sysbuf));
 
-	else if (idtype == DEV_ID_TYPE_MPATH_UUID)
-		_read_sys_block(cmd, dev, "dm/uuid", sysbuf, sizeof(sysbuf));
+	else if (idtype == DEV_ID_TYPE_MPATH_UUID) {
+		read_sys_block(cmd, dev, "dm/uuid", sysbuf, sizeof(sysbuf));
+		/* if (strncmp(sysbuf, "mpath", 5)) sysbuf[0] = '\0'; */
+	}
 
-	else if (idtype == DEV_ID_TYPE_CRYPT_UUID)
-		_read_sys_block(cmd, dev, "dm/uuid", sysbuf, sizeof(sysbuf));
+	else if (idtype == DEV_ID_TYPE_CRYPT_UUID) {
+		read_sys_block(cmd, dev, "dm/uuid", sysbuf, sizeof(sysbuf));
+		/* if (strncmp(sysbuf, "CRYPT", 5)) sysbuf[0] = '\0'; */
+	}
 
-	else if (idtype == DEV_ID_TYPE_LVMLV_UUID)
-		_read_sys_block(cmd, dev, "dm/uuid", sysbuf, sizeof(sysbuf));
+	else if (idtype == DEV_ID_TYPE_LVMLV_UUID) {
+		read_sys_block(cmd, dev, "dm/uuid", sysbuf, sizeof(sysbuf));
+		/* if (strncmp(sysbuf, "LVM", 3)) sysbuf[0] = '\0'; */
+	}
 
-	else if (idtype == DEV_ID_TYPE_MD_UUID)
-		_read_sys_block(cmd, dev, "md/uuid", sysbuf, sizeof(sysbuf));
+	else if (idtype == DEV_ID_TYPE_MD_UUID) {
+		read_sys_block(cmd, dev, "md/uuid", sysbuf, sizeof(sysbuf));
+	}
 
 	else if (idtype == DEV_ID_TYPE_LOOP_FILE) {
-		_read_sys_block(cmd, dev, "loop/backing_file", sysbuf, sizeof(sysbuf));
+		read_sys_block(cmd, dev, "loop/backing_file", sysbuf, sizeof(sysbuf));
 		/* if backing file is deleted, fall back to devname */
 		if (strstr(sysbuf, "(deleted)"))
 			sysbuf[0] = '\0';
 	}
 
 	else if (idtype == DEV_ID_TYPE_DEVNAME) {
+		if (dm_list_empty(&dev->aliases))
+			goto_bad;
 		if (!(idname = strdup(dev_name(dev))))
 			goto_bad;
 		return idname;
+	}
+
+	for (i = 0; i < strlen(sysbuf); i++) {
+		if (isblank(sysbuf[i]) || isspace(sysbuf[i]) || iscntrl(sysbuf[i]))
+			sysbuf[i] = '_';
 	}
 
 	if (!sysbuf[0])
@@ -346,7 +367,6 @@ const char *device_id_system_read(struct cmd_context *cmd, struct device *dev, u
 
 	return idname;
  bad:
-	log_debug("No idtype %s for %s", idtype_to_str(idtype), dev_name(dev));
 	return NULL;
 }
 
@@ -358,23 +378,43 @@ static int _dev_has_stable_id(struct cmd_context *cmd, struct device *dev)
 {
 	char sysbuf[PATH_MAX] = { 0 };
 	struct dev_id *id;
+	const char *idname;
 
+	/*
+	 * An idtype other than DEVNAME is stable, i.e. it doesn't change after
+	 * reboot or device reattach.
+	 * An id on dev->ids with idtype set and !idname means that idtype does
+	 * not exist for the dev.  (Optimization to avoid repeated negative
+	 * system_read.)
+	 */
 	dm_list_iterate_items(id, &dev->ids) {
-		if (id->idtype != DEV_ID_TYPE_DEVNAME)
+		if ((id->idtype != DEV_ID_TYPE_DEVNAME) && id->idname)
 			return 1;
 	}
 
-	if (_read_sys_block(cmd, dev, "device/wwid", sysbuf, sizeof(sysbuf)))
-		return 1;
+	/*
+	 * Use device_id_system_read() instead of read_sys_block() when
+	 * system_read ignores some values from sysfs.
+	 */
 
-	if (_read_sys_block(cmd, dev, "wwid", sysbuf, sizeof(sysbuf)))
+	if ((idname = device_id_system_read(cmd, dev, DEV_ID_TYPE_SYS_WWID))) {
+		free((void*)idname);
 		return 1;
+	}
 
-	if (_read_sys_block(cmd, dev, "device/serial", sysbuf, sizeof(sysbuf)))
+	if ((idname = device_id_system_read(cmd, dev, DEV_ID_TYPE_SYS_SERIAL))) {
+		free((void*)idname);
 		return 1;
+	}
+
+	if ((MAJOR(dev->dev) == cmd->dev_types->loop_major) &&
+	    (idname = device_id_system_read(cmd, dev, DEV_ID_TYPE_LOOP_FILE))) {
+		free((void*)idname);
+		return 1;
+	}
 
 	if ((MAJOR(dev->dev) == cmd->dev_types->device_mapper_major)) {
-		if (!_read_sys_block(cmd, dev, "dm/uuid", sysbuf, sizeof(sysbuf)))
+		if (!read_sys_block(cmd, dev, "dm/uuid", sysbuf, sizeof(sysbuf)))
 			goto_out;
 
 		if (_dm_uuid_has_prefix(sysbuf, "mpath-"))
@@ -386,12 +426,9 @@ static int _dev_has_stable_id(struct cmd_context *cmd, struct device *dev)
 	}
 
 	if ((MAJOR(dev->dev) == cmd->dev_types->md_major) &&
-	    _read_sys_block(cmd, dev, "md/uuid", sysbuf, sizeof(sysbuf)))
+	    read_sys_block(cmd, dev, "md/uuid", sysbuf, sizeof(sysbuf)))
 		return 1;
 
-	if ((MAJOR(dev->dev) == cmd->dev_types->loop_major) &&
-	    _read_sys_block(cmd, dev, "loop/backing_file", sysbuf, sizeof(sysbuf)))
-		return 1;
  out:
 	/* DEV_ID_TYPE_DEVNAME would be used for this dev. */
 	return 0;
@@ -528,11 +565,8 @@ int device_ids_read(struct cmd_context *cmd)
 			log_debug("read devices file systemid %s", _devices_file_systemid);
 			if ((!cmd->system_id && _devices_file_systemid[0]) ||
 			    (cmd->system_id && strcmp(cmd->system_id, _devices_file_systemid))) {
-				log_warn("WARNING: ignoring devices file with wrong system id %s vs local %s.",
+				log_warn("WARNING: devices file has unmatching system id %s vs local %s.",
 					  _devices_file_systemid[0] ? _devices_file_systemid : "none", cmd->system_id ?: "none");
-				free_dus(&cmd->use_devices);
-				ret = 0;
-				goto out;
 			}
 			continue;
 		}
@@ -598,7 +632,6 @@ int device_ids_read(struct cmd_context *cmd)
 
 		dm_list_add(&cmd->use_devices, &du->list);
 	}
-out:
 	if (fclose(fp))
 		stack;
 
@@ -659,6 +692,9 @@ int device_ids_write(struct cmd_context *cmd)
 		log_warn("Creating devices file %s", cmd->devices_file_path);
 		cmd->enable_devices_file = 1;
 	}
+
+	if (test_mode())
+		return 1;
 
 	if (_devices_file_version[0]) {
 		if (sscanf(_devices_file_version, "%u.%u.%u", &df_major, &df_minor, &df_counter) != 3) {
@@ -767,9 +803,8 @@ static void _device_ids_update_try(struct cmd_context *cmd)
 {
 	int held = 0;
 
-	/* Defer updates to non-pvscan-cache commands. */
-	if (cmd->pvscan_cache_single) {
-		log_print("pvscan[%d] skip updating devices file.", getpid());
+	if (cmd->expect_missing_vg_device) {
+		log_print("Devices file update skipped."); 
 		return;
 	}
 
@@ -841,6 +876,28 @@ int device_ids_use_devname(struct cmd_context *cmd)
 	return 0;
 }
 
+static int _device_ids_use_lvmlv(struct cmd_context *cmd)
+{
+	struct dev_use *du;
+
+	dm_list_iterate_items(du, &cmd->use_devices) {
+		if (du->idtype == DEV_ID_TYPE_LVMLV_UUID)
+			return 1;
+	}
+	return 0;
+}
+
+struct dev_use *get_du_for_devno(struct cmd_context *cmd, dev_t devno)
+{
+	struct dev_use *du;
+
+	dm_list_iterate_items(du, &cmd->use_devices) {
+		if (du->dev && du->dev->dev == devno)
+			return du;
+	}
+	return NULL;
+}
+
 struct dev_use *get_du_for_dev(struct cmd_context *cmd, struct device *dev)
 {
 	struct dev_use *du;
@@ -859,13 +916,13 @@ struct dev_use *get_du_for_pvid(struct cmd_context *cmd, const char *pvid)
 	dm_list_iterate_items(du, &cmd->use_devices) {
 		if (!du->pvid)
 			continue;
-		if (!strcmp(du->pvid, pvid))
+		if (!memcmp(du->pvid, pvid, ID_LEN))
 			return du;
 	}
 	return NULL;
 }
 
-static struct dev_use *_get_du_for_devname(struct cmd_context *cmd, const char *devname)
+struct dev_use *get_du_for_devname(struct cmd_context *cmd, const char *devname)
 {
 	struct dev_use *du;
 
@@ -878,7 +935,7 @@ static struct dev_use *_get_du_for_devname(struct cmd_context *cmd, const char *
 	return NULL;
 }
 
-static struct dev_use *_get_du_for_device_id(struct cmd_context *cmd, uint16_t idtype, const char *idname)
+struct dev_use *get_du_for_device_id(struct cmd_context *cmd, uint16_t idtype, const char *idname)
 {
 	struct dev_use *du;
 
@@ -906,6 +963,14 @@ int device_id_add(struct cmd_context *cmd, struct device *dev, const char *pvid_
 	struct dev_use *du, *update_du = NULL, *du_dev, *du_pvid, *du_devname, *du_devid;
 	struct dev_id *id;
 	int found_id = 0;
+	int part = 0;
+
+	if (!dev_get_partition_number(dev, &part))
+		return_0;
+
+	/* Ensure valid dev_name(dev) below. */
+	if (dm_list_empty(&dev->aliases))
+		return_0;
 
 	/*
 	 * When enable_devices_file=0 and pending_devices_file=1 we let
@@ -923,10 +988,6 @@ int device_id_add(struct cmd_context *cmd, struct device *dev, const char *pvid_
 	 * Make a terminated copy to use as a string.
 	 */
 	memcpy(&pvid, pvid_arg, ID_LEN);
-
-	du_dev = get_du_for_dev(cmd, dev);
-	du_pvid = get_du_for_pvid(cmd, pvid);
-	du_devname = _get_du_for_devname(cmd, dev_name(dev));
 
 	/*
 	 * Choose the device_id type for the device being added.
@@ -959,7 +1020,7 @@ int device_id_add(struct cmd_context *cmd, struct device *dev, const char *pvid_
 	}
 
 	if (MAJOR(dev->dev) == cmd->dev_types->device_mapper_major) {
-		if (_dev_has_mpath_uuid(cmd, dev, &idname)) {
+		if (dev_has_mpath_uuid(cmd, dev, &idname)) {
 			idtype = DEV_ID_TYPE_MPATH_UUID;
 			goto id_done;
 		}
@@ -1043,6 +1104,9 @@ id_done:
 	idtype = 0;
 
 	/*
+	 * "dev" is the device we are adding.
+	 * "id" is the device_id it's using, set in dev->id.
+	 *
 	 * Update the cmd->use_devices list for the new device.  The
 	 * use_devices list will be used to update the devices file.
 	 *
@@ -1054,23 +1118,57 @@ id_done:
 	 * those other entries to fix any incorrect info.
 	 */
 
-	du_devid = _get_du_for_device_id(cmd, id->idtype, id->idname);
+	/* Is there already an entry matched to this device? */
+	du_dev = get_du_for_dev(cmd, dev);
+
+	/* Is there already an entry matched to this device's pvid? */
+	du_pvid = get_du_for_pvid(cmd, pvid);
+
+	/* Is there already an entry using this device's name? */
+	du_devname = get_du_for_devname(cmd, dev_name(dev));
+
+	/* Is there already an entry using the device_id for this device? */
+	du_devid = get_du_for_device_id(cmd, id->idtype, id->idname);
 
 	if (du_dev)
-		log_debug("device_id_add %s pvid %s matches du_dev %p dev %s",
+		log_debug("device_id_add %s pvid %s matches entry %p dev %s",
 			  dev_name(dev), pvid, du_dev, dev_name(du_dev->dev));
 	if (du_pvid)
-		log_debug("device_id_add %s pvid %s matches du_pvid %p dev %s pvid %s",
+		log_debug("device_id_add %s pvid %s matches entry %p dev %s with same pvid %s",
 			  dev_name(dev), pvid, du_pvid, du_pvid->dev ? dev_name(du_pvid->dev) : ".",
 			  du_pvid->pvid);
 	if (du_devid)
-		log_debug("device_id_add %s pvid %s matches du_devid %p dev %s pvid %s",
+		log_debug("device_id_add %s pvid %s matches entry %p dev %s with same device_id %d %s",
 			  dev_name(dev), pvid, du_devid, du_devid->dev ? dev_name(du_devid->dev) : ".",
-			  du_devid->pvid);
+			  du_devid->idtype, du_devid->idname);
 	if (du_devname)
-		log_debug("device_id_add %s pvid %s matches du_devname %p dev %s pvid %s",
+		log_debug("device_id_add %s pvid %s matches entry %p dev %s with same devname %s",
 			  dev_name(dev), pvid, du_devname, du_devname->dev ? dev_name(du_devname->dev) : ".",
-			  du_devname->pvid);
+			  du_devname->devname);
+
+	if (du_pvid && (du_pvid->dev != dev))
+		log_warn("WARNING: adding device %s with PVID %s which is already used for %s.",
+			 dev_name(dev), pvid, du_pvid->dev ? dev_name(du_pvid->dev) : "missing device");
+
+	if (du_devid && (du_devid->dev != dev)) {
+		if (!du_devid->dev) {
+			log_warn("WARNING: adding device %s with idname %s which is already used for missing device.",
+				 dev_name(dev), id->idname);
+		} else {
+			int ret1, ret2;
+			dev_t devt1, devt2;
+			/* Check if both entries are partitions of the same device. */
+			ret1 = dev_get_primary_dev(cmd->dev_types, dev, &devt1);
+			ret2 = dev_get_primary_dev(cmd->dev_types, du_devid->dev, &devt2);
+			if ((ret1 == 2) && (ret2 == 2) && (devt1 == devt2)) {
+				log_debug("Using separate entries for partitions of same device %s part %d %s part %d.",
+					  dev_name(dev), part, dev_name(du_devid->dev), du_devid->part);
+			} else {
+				log_warn("WARNING: adding device %s with idname %s which is already used for %s.",
+					 dev_name(dev), id->idname, dev_name(du_devid->dev));
+			}
+		}
+	}
 
 	/*
 	 * If one of the existing entries (du_dev, du_pvid, du_devid, du_devname)
@@ -1083,29 +1181,6 @@ id_done:
 		dm_list_del(&update_du->list);
 		update_matching_kind = "device";
 		update_matching_name = dev_name(dev);
-
-		if (du_devid && (du_devid != du_dev)) {
-			log_warn("WARNING: device %s (%s) and %s (%s) have duplicate device ID.",
-				 dev_name(dev), id->idname,
-				 (du_pvid && du_pvid->dev) ? dev_name(du_pvid->dev) : "none",
-				 du_pvid ? du_pvid->idname : "");
-		}
-
-		if (du_pvid && (du_pvid != du_dev)) {
-			log_warn("WARNING: device %s (%s) and %s (%s) have duplicate PVID %s",
-				 dev_name(dev), id->idname,
-				 du_pvid->dev ? dev_name(du_pvid->dev) : "none", du_pvid->idname,
-				 pvid);
-		}
-
-		if (du_devname && (du_devname != du_dev)) {
-			/* clear devname in another entry with our devname */
-			log_warn("Devices file PVID %s clearing wrong DEVNAME %s.",
-				 du_devname->pvid, du_devname->devname);
-			free(du_devname->devname);
-			du_devname->devname = NULL;
-		}
-
 	} else if (du_pvid) {
 		/*
 		 * If the device_id of the existing entry for PVID is the same
@@ -1125,32 +1200,13 @@ id_done:
 			update_matching_kind = "PVID";
 			update_matching_name = pvid;
 		} else {
-			log_warn("WARNING: device %s (%s) and %s (%s) have duplicate PVID %s",
-				 dev_name(dev), id->idname,
-				 du_pvid->dev ? dev_name(du_pvid->dev) : "none", du_pvid->idname,
-				 pvid);
-
-			if (yes_no_prompt("Add device with duplicate PV to devices file?") == 'n') {
+			if (!cmd->current_settings.yes &&
+			    yes_no_prompt("Add device with duplicate PV to devices file?") == 'n') {
 				log_print("Device not added.");
 				free((void *)check_idname);
 				return 1;
 			}
 		}
-
-		if (du_devid && (du_devid != du_pvid)) {
-			/* warn about another entry using the same device_id */
-			log_warn("WARNING: duplicate device_id %s for PVIDs %s %s",
-				 du_devid->idname, du_devid->pvid, du_pvid->pvid);
-		}
-
-		if (du_devname && (du_devname != du_pvid)) {
-			/* clear devname in another entry with our devname */
-			log_warn("Devices file PVID %s clearing wrong DEVNAME %s.",
-				 du_devname->pvid, du_devname->devname);
-			free(du_devname->devname);
-			du_devname->devname = NULL;
-		}
-
 	} else if (du_devid) {
 		/*
 		 * Do we create a new du or update the existing du?
@@ -1165,64 +1221,13 @@ id_done:
 		 * the same device_id (create a new du for dev.)
 		 * If not, then update the existing du_devid.
 		 */
-		
-		if (du_devid->dev != dev)
-			check_idname = device_id_system_read(cmd, du_devid->dev, id->idtype);
-
-		if (check_idname && !strcmp(check_idname, id->idname)) {
-			int ret1, ret2;
-			dev_t devt1, devt2;
-
-			/*
-			 * two different devices have the same device_id,
-			 * create a new du for the device being added
-			 */
-
-			/* dev_is_partitioned() the dev open to read it. */
-			if (!label_scan_open(du_devid->dev))
-				log_warn("Cannot open %s", dev_name(du_devid->dev));
-
-			if (dev_is_partitioned(cmd->dev_types, du_devid->dev)) {
-				/* Check if existing entry is whole device and new entry is a partition of it. */
-				ret1 = dev_get_primary_dev(cmd->dev_types, dev, &devt1);
-				if ((ret1 == 2) && (devt1 == du_devid->dev->dev))
-					log_warn("Remove partitioned device %s from devices file.", dev_name(du_devid->dev));
-			} else {
-				/* Check if both entries are partitions of the same device. */
-				ret1 = dev_get_primary_dev(cmd->dev_types, dev, &devt1);
-				ret2 = dev_get_primary_dev(cmd->dev_types, du_devid->dev, &devt2);
-
-				if ((ret1 == 2) && (ret2 == 2) && (devt1 == devt2)) {
-					log_warn("Partitions %s %s have same device_id %s",
-						 dev_name(dev), dev_name(du_devid->dev), id->idname);
-				} else {
-					log_warn("Duplicate device_id %s %s for %s and %s",
-						 idtype_to_str(id->idtype), check_idname,
-						 dev_name(dev), dev_name(du_devid->dev));
-				}
-			}
-		} else {
+		if (du_devid->dev == dev) {
 			/* update the existing entry with matching devid */
 			update_du = du_devid;
 			dm_list_del(&update_du->list);
 			update_matching_kind = "device_id";
 			update_matching_name = id->idname;
 		}
-
-		if (du_devname && (du_devname != du_devid)) {
-			/* clear devname in another entry with our devname */
-			log_warn("Devices file PVID %s clearing wrong DEVNAME %s",
-				 du_devname->pvid, du_devname->devname);
-			free(du_devname->devname);
-			du_devname->devname = NULL;
-		}
-
-	} else if (du_devname) {
-		/* clear devname in another entry with our devname */
-		log_warn("Devices file PVID %s clearing wrong DEVNAME %s",
-			 du_devname->pvid, du_devname->devname);
-		free(du_devname->devname);
-		du_devname->devname = NULL;
 	}
 
 	free((void *)check_idname);
@@ -1283,6 +1288,128 @@ void device_id_pvremove(struct cmd_context *cmd, struct device *dev)
 	}
 }
 
+void device_id_update_vg_uuid(struct cmd_context *cmd, struct volume_group *vg, struct id *old_vg_id)
+{
+	struct dev_use *du;
+	struct lv_list *lvl;
+	char old_vgid[ID_LEN+1] = { 0 };
+	char new_vgid[ID_LEN+1] = { 0 };
+	char old_idname[PATH_MAX];
+	int update = 0;
+
+	if (!cmd->enable_devices_file)
+		return;
+
+	/* Without this setting there is no stacking LVs on PVs. */
+	if (!cmd->scan_lvs)
+		return;
+
+	/* Check if any devices file entries are stacked on LVs. */
+	if (!_device_ids_use_lvmlv(cmd))
+		return;
+
+	memcpy(old_vgid, old_vg_id, ID_LEN);
+	memcpy(new_vgid, &vg->id, ID_LEN);
+
+	/*
+	 * for each LV in VG, if there is a du for that LV (meaning a PV exists
+	 * on the LV), then update the du idname, replacing the old vgid with
+	 * the new vgid.
+	 */
+	dm_list_iterate_items(lvl, &vg->lvs) {
+		memset(old_idname, 0, sizeof(old_idname));
+		memcpy(old_idname, "LVM-", 4);
+		memcpy(old_idname+4, old_vgid, ID_LEN);
+		memcpy(old_idname+4+ID_LEN, &lvl->lv->lvid.id[1], ID_LEN);
+
+		if ((du = get_du_for_device_id(cmd, DEV_ID_TYPE_LVMLV_UUID, old_idname))) {
+			log_debug("device_id update %s pvid %s vgid %s to %s",
+				  du->devname ?: ".", du->pvid ?: ".", old_vgid, new_vgid);
+			memcpy(du->idname+4, new_vgid, ID_LEN);
+			update = 1;
+
+			if (du->dev && du->dev->id && (du->dev->id->idtype == DEV_ID_TYPE_LVMLV_UUID))
+				memcpy(du->dev->id->idname+4, new_vgid, ID_LEN);
+		}
+	}
+
+	if (update &&
+	    !device_ids_write(cmd))
+		stack;
+	unlock_devices_file(cmd);
+}
+
+static int _idtype_compatible_with_major_number(struct cmd_context *cmd, int idtype, int major)
+{
+	/* devname can be used with any kind of device */
+	if (idtype == DEV_ID_TYPE_DEVNAME)
+		return 1;
+
+	if (idtype == DEV_ID_TYPE_MPATH_UUID ||
+	    idtype == DEV_ID_TYPE_CRYPT_UUID ||
+	    idtype == DEV_ID_TYPE_LVMLV_UUID)
+		return (major == cmd->dev_types->device_mapper_major);
+
+	if (idtype == DEV_ID_TYPE_MD_UUID)
+		return (major == cmd->dev_types->md_major);
+
+	if (idtype == DEV_ID_TYPE_LOOP_FILE)
+		return (major == cmd->dev_types->loop_major);
+
+	if (major == cmd->dev_types->device_mapper_major)
+		return (idtype == DEV_ID_TYPE_MPATH_UUID ||
+			idtype == DEV_ID_TYPE_CRYPT_UUID ||
+			idtype == DEV_ID_TYPE_LVMLV_UUID ||
+			idtype == DEV_ID_TYPE_DEVNAME);
+
+	if (major == cmd->dev_types->md_major)
+		return (idtype == DEV_ID_TYPE_MD_UUID ||
+			idtype == DEV_ID_TYPE_DEVNAME);
+
+	if (major == cmd->dev_types->loop_major)
+		return (idtype == DEV_ID_TYPE_LOOP_FILE ||
+			idtype == DEV_ID_TYPE_DEVNAME);
+
+	return 1;
+}
+
+static int _match_dm_devnames(struct cmd_context *cmd, struct device *dev,
+			      struct dev_id *id, struct dev_use *du)
+{
+	struct stat buf;
+
+	if (MAJOR(dev->dev) != cmd->dev_types->device_mapper_major)
+		return 0;
+
+	if (id->idname && du->idname && !strcmp(id->idname, du->idname))
+		return 1;
+
+	if (du->idname && !strcmp(du->idname, dev_name(dev))) {
+		log_debug("Match device_id %s %s to %s: ignoring idname %s",
+			  idtype_to_str(du->idtype), du->idname, dev_name(dev), id->idname ?: ".");
+		return 1;
+	}
+
+	if (!du->idname)
+		return 0;
+
+	/* detect that a du entry is for a dm device */
+
+	if (!strncmp(du->idname, "/dev/dm-", 8) || !strncmp(du->idname, "/dev/mapper/", 12)) {
+		if (stat(du->idname, &buf))
+			return 0;
+
+		if ((MAJOR(buf.st_rdev) == cmd->dev_types->device_mapper_major) &&
+		    (MINOR(buf.st_rdev) == MINOR(dev->dev))) {
+			log_debug("Match device_id %s %s to %s: using other dm name, ignoring %s",
+				  idtype_to_str(du->idtype), du->idname, dev_name(dev), id->idname ?: ".");
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
 /*
  * check for dev->ids entry with du->idtype, if found compare it,
  * if not, system_read of this type and add entry to dev->ids, compare it.
@@ -1295,35 +1422,74 @@ static int _match_du_to_dev(struct cmd_context *cmd, struct dev_use *du, struct 
 	const char *idname;
 	int part;
 
-	if (!du->idname || !du->idtype)
+	/*
+	 * The idname will be removed from an entry with devname type when the
+	 * devname is read and found to hold a different PVID than the PVID in
+	 * the entry.  At that point we only have the PVID and no known
+	 * location for it.
+	 */
+	if (!du->idname || !du->idtype) {
+		/*
+		log_debug("Mismatch device_id %s %s %s to %s",
+			  du->idtype ? idtype_to_str(du->idtype) : "idtype_missing",
+			  du->idname ? du->idname : "idname_missing",
+			  du->devname ? du->devname : "devname_missing",
+			  dev_name(dev));
+		*/
 		return 0;
+	}
+
+	/*
+	 * Some idtypes can only match devices with a specific major number,
+	 * so we can skip trying to match certain du entries based simply on
+	 * the major number of dev.
+	 */
+	if (!_idtype_compatible_with_major_number(cmd, du->idtype, (int)MAJOR(dev->dev))) {
+		/*
+		log_debug("Mismatch device_id %s %s to %s: wrong major",
+			  idtype_to_str(du->idtype), du->idname ?: ".", dev_name(dev));
+		*/
+		return 0;
+	}
 
 	if (!dev_get_partition_number(dev, &part)) {
-		log_debug("compare %s failed to get dev partition", dev_name(dev));
+		/*
+		log_debug("Mismatch device_id %s %s to %s: no partition",
+			  idtype_to_str(du->idtype), du->idname ?: ".", dev_name(dev));
+		*/
 		return 0;
 	}
 	if (part != du->part) {
 		/*
-		log_debug("compare mis %s %s part %d to %s part %d",
-			  idtype_to_str(du->idtype), du->idname ?: ".", du->part, dev_name(dev), part);
+		log_debug("Mismatch device_id %s %s to %s: wrong partition %d vs %d",
+			  idtype_to_str(du->idtype), du->idname ?: ".", dev_name(dev), du->part, part);
 		*/
 		return 0;
 	}
 
 	dm_list_iterate_items(id, &dev->ids) {
 		if (id->idtype == du->idtype) {
-			if (id->idname && !strcmp(id->idname, du->idname)) {
+			if ((id->idtype == DEV_ID_TYPE_DEVNAME) && _match_dm_devnames(cmd, dev, id, du)) {
+				/* dm devs can have differing names that we know still match */
 				du->dev = dev;
 				dev->id = id;
 				dev->flags |= DEV_MATCHED_USE_ID;
-				log_debug("compare match %s %s to %s",
+				log_debug("Match device_id %s %s to %s: dm names",
 					  idtype_to_str(du->idtype), du->idname, dev_name(dev));
 				return 1;
+
+			} else if (id->idname && !strcmp(id->idname, du->idname)) {
+				du->dev = dev;
+				dev->id = id;
+				dev->flags |= DEV_MATCHED_USE_ID;
+				log_debug("Match device_id %s %s to %s",
+					  idtype_to_str(du->idtype), du->idname, dev_name(dev));
+				return 1;
+
 			} else {
 				/*
-				log_debug("compare mis %s %s to %s %s",
-			  		  idtype_to_str(du->idtype), du->idname ?: ".", dev_name(dev),
-					  ((id->idtype != DEV_ID_TYPE_DEVNAME) && id->idname) ? id->idname : "");
+				log_debug("Mismatch device_id %s %s to %s: idname %s",
+			  		  idtype_to_str(du->idtype), du->idname ?: ".", dev_name(dev), id->idname ?: ":");
 				*/
 				return 0;
 			}
@@ -1343,7 +1509,7 @@ static int _match_du_to_dev(struct cmd_context *cmd, struct dev_use *du, struct 
 		id->dev = dev;
 		dm_list_add(&dev->ids, &id->list);
 		/*
-		log_debug("compare mis %s %s to %s no idtype",
+		log_debug("Mismatch device_id %s %s to %s: no idtype",
 			  idtype_to_str(du->idtype), du->idname ?: ".", dev_name(dev));
 		*/
 		return 0;
@@ -1362,15 +1528,14 @@ static int _match_du_to_dev(struct cmd_context *cmd, struct dev_use *du, struct 
 		du->dev = dev;
 		dev->id = id;
 		dev->flags |= DEV_MATCHED_USE_ID;
-		log_debug("compare match %s %s to %s",
+		log_debug("Match device_id %s %s to %s",
 			  idtype_to_str(du->idtype), du->idname, dev_name(dev));
 		return 1;
 	}
 
 	/*
-	log_debug("compare mis %s %s to %s %s",
-		  idtype_to_str(du->idtype), du->idname ?: ".", dev_name(dev),
-		  ((id->idtype != DEV_ID_TYPE_DEVNAME) && id->idname) ? id->idname : "");
+	log_debug("Mismatch device_id %s %s to %s: idname %s",
+		  idtype_to_str(du->idtype), du->idname ?: ".", dev_name(dev), idname);
 	*/
 	return 0;
 }
@@ -1380,7 +1545,7 @@ int device_ids_match_dev(struct cmd_context *cmd, struct device *dev)
 	struct dev_use *du;
 
 	/* First check the du entry with matching devname since it's likely correct. */
-	if ((du = _get_du_for_devname(cmd, dev_name(dev)))) {
+	if ((du = get_du_for_devname(cmd, dev_name(dev)))) {
 		if (_match_du_to_dev(cmd, du, dev))
 			return 1;
 	}
@@ -1421,6 +1586,22 @@ int device_ids_match_dev(struct cmd_context *cmd, struct device *dev)
  * passes the filter.
  */
 
+void device_ids_match_device_list(struct cmd_context *cmd)
+{
+	struct dev_use *du;
+
+	dm_list_iterate_items(du, &cmd->use_devices) {
+		if (du->dev)
+			continue;
+		if (!(du->dev = dev_cache_get_existing(cmd, du->devname, NULL))) {
+			log_warn("Device not found for %s.", du->devname);
+		} else {
+			/* Should we set dev->id?  Which idtype?  Use --deviceidtype? */
+			du->dev->flags |= DEV_MATCHED_USE_ID;
+		}
+	}
+}
+
 void device_ids_match(struct cmd_context *cmd)
 {
 	struct dev_iter *iter;
@@ -1428,16 +1609,7 @@ void device_ids_match(struct cmd_context *cmd)
 	struct device *dev;
 
 	if (cmd->enable_devices_list) {
-		dm_list_iterate_items(du, &cmd->use_devices) {
-			if (du->dev)
-				continue;
-			if (!(du->dev = dev_cache_get(cmd, du->devname, NULL))) {
-				log_warn("Device not found for %s.", du->devname);
-			} else {
-				/* Should we set dev->id?  Which idtype?  Use --deviceidtype? */
-				du->dev->flags |= DEV_MATCHED_USE_ID;
-			}
-		}
+		device_ids_match_device_list(cmd);
 		return;
 	}
 
@@ -1469,7 +1641,7 @@ void device_ids_match(struct cmd_context *cmd)
 		 * the du/dev pairs in preparation for using the filters.
 		 */
 		if (du->devname &&
-		    (dev = dev_cache_get(cmd, du->devname, NULL))) {
+		    (dev = dev_cache_get_existing(cmd, du->devname, NULL))) {
 			/* On successful match, du, dev, and id are linked. */
 			if (_match_du_to_dev(cmd, du, dev))
 				continue;
@@ -1502,6 +1674,9 @@ void device_ids_match(struct cmd_context *cmd)
 		}
 		dev_iter_destroy(iter);
 	}
+
+	if (!cmd->print_device_id_not_found)
+		return;
 
 	/*
 	 * Look for entries in devices file for which we found no device.
@@ -1588,13 +1763,20 @@ void device_ids_validate(struct cmd_context *cmd, struct dm_list *scanned_devs,
 			continue;
 
 		/*
+		 * The matched device could not be read so we do not have
+		 * the PVID from disk and cannot verify the devices file entry.
+		 */
+		if (dev->flags & DEV_SCAN_NOT_READ)
+			continue;
+
+		/*
 		 * du and dev may have been matched, but the dev could still
 		 * have been excluded by other filters during label scan.
 		 * This shouldn't generally happen, but if it does the user
 		 * probably wants to do something about it.
 		 */
 		if (!cmd->filter->passes_filter(cmd, cmd->filter, dev, "persistent")) {
-			log_warn("Devices file %s is excluded by filter: %s.",
+			log_warn("Devices file %s is excluded: %s.",
 				 dev_name(dev), dev_filtered_reason(dev));
 			continue;
 		}
@@ -1628,6 +1810,15 @@ void device_ids_validate(struct cmd_context *cmd, struct dm_list *scanned_devs,
 			}
 		}
 
+		/*
+		 * Avoid thrashing changes to the devices file during
+		 * startup due to device names that are still being
+		 * established.  Commands that may run during startup
+		 * should set this flag.
+		 */
+		if (cmd->ignore_device_name_mismatch)
+			continue;
+
 		if (!du->devname || strcmp(dev_name(du->dev), du->devname)) {
 			log_warn("Device %s has updated name (devices file %s)",
 				 dev_name(du->dev), du->devname ?: "none");
@@ -1660,8 +1851,18 @@ void device_ids_validate(struct cmd_context *cmd, struct dm_list *scanned_devs,
 		if (scanned_devs && !dev_in_device_list(dev, scanned_devs))
 			continue;
 
+		/*
+		 * The matched device could not be read so we do not have
+		 * the PVID from disk and cannot verify the devices file entry.
+		 */
+		if (dev->flags & DEV_SCAN_NOT_READ)
+			continue;
+
+		if (dm_list_empty(&dev->aliases))
+			continue;
+
 		if (!cmd->filter->passes_filter(cmd, cmd->filter, dev, "persistent")) {
-			log_warn("Devices file %s is excluded by filter: %s.",
+			log_warn("Devices file %s is excluded: %s.",
 				 dev_name(dev), dev_filtered_reason(dev));
 			/* FIXME: what if this dev is wrongly matched and should be checked below? */
 			continue;
@@ -1675,7 +1876,7 @@ void device_ids_validate(struct cmd_context *cmd, struct dm_list *scanned_devs,
 		/*
 		 * A good match based on pvid.
 		 */
-		if (dev->pvid[0] && !strcmp(dev->pvid, du->pvid)) {
+		if (dev->pvid[0] && !memcmp(dev->pvid, du->pvid, ID_LEN)) {
 			const char *devname = dev_name(dev);
 
 			if (strcmp(devname, du->idname)) {
@@ -1775,6 +1976,14 @@ void device_ids_validate(struct cmd_context *cmd, struct dm_list *scanned_devs,
 			*device_ids_invalid = 1;
 	}
 
+	/*
+	 * When a new devname/pvid mismatch is discovered, a new search for the
+	 * pvid should be permitted (searched_devnames may exist to suppress
+	 * searching for other pvids.)
+	 */
+	if (update_file)
+		unlink_searched_devnames(cmd);
+
 	/* FIXME: for wrong devname cases, wait to write new until device_ids_find_renamed_devs? */
 
 	/*
@@ -1843,12 +2052,19 @@ void device_ids_find_renamed_devs(struct cmd_context *cmd, struct dm_list *dev_l
 	search_auto = !strcmp(cmd->search_for_devnames, "auto");
 
 	dm_list_iterate_items(du, &cmd->use_devices) {
-		if (du->dev)
-			continue;
 		if (!du->pvid)
 			continue;
 		if (du->idtype != DEV_ID_TYPE_DEVNAME)
 			continue;
+
+		/*
+		 * if the old incorrect devname is now a device that's
+		 * filtered and not scanned, e.g. an mpath component,
+		 * then we want to look for the pvid on a new device.
+		 */
+		if (du->dev && !du->dev->filtered_flags)
+			continue;
+
 		if (!(dil = dm_pool_zalloc(cmd->mem, sizeof(*dil))))
 			continue;
 
@@ -1873,6 +2089,11 @@ void device_ids_find_renamed_devs(struct cmd_context *cmd, struct dm_list *dev_l
 	 * the searched file, so a subsequent lvm command will do the search
 	 * again.  In future perhaps we could add a policy to automatically
 	 * remove a devices file entry that's not been found for some time.
+	 *
+	 * TODO: like the hint file, add a hash of all devnames to the searched
+	 * file so it can be ignored and removed if the devs/hash change.
+	 * If hints are enabled, the hints invalidation could also remove the
+	 * searched file.
 	 */
 	if (_searched_devnames_exists(cmd)) {
 		log_debug("Search for PVIDs skipped for %s", _searched_file);
@@ -1939,6 +2160,12 @@ void device_ids_find_renamed_devs(struct cmd_context *cmd, struct dm_list *dev_l
 		 *
 		 * TODO: in auto mode should we look in other non-system
 		 * devices files and skip any devs included in those?
+		 *
+		 * Note that a user can override a stable id type and use
+		 * devname for a device's id, in which case this optimization
+		 * can prevent a search from finding a renamed dev.  So, if a
+		 * user forces a devname id, then they should probably also
+		 * set search_for_devnames=all.
 		 */
 		if (search_auto && _dev_has_stable_id(cmd, dev)) {
 			other_idtype++;
@@ -2017,14 +2244,14 @@ void device_ids_find_renamed_devs(struct cmd_context *cmd, struct dm_list *dev_l
 	dm_list_iterate_items(dil, &search_pvids) {
 		char *dup_devname1, *dup_devname2, *dup_devname3;
 
-		if (!dil->dev) {
+		if (!dil->dev || dm_list_empty(&dil->dev->aliases)) {
 			not_found++;
 			continue;
 		}
-		found++;
 
 		dev = dil->dev;
 		devname = dev_name(dev);
+		found++;
 
 		if (!(du = get_du_for_pvid(cmd, dil->pvid))) {
 			/* shouldn't happen */
@@ -2048,7 +2275,8 @@ void device_ids_find_renamed_devs(struct cmd_context *cmd, struct dm_list *dev_l
 			continue;
 		}
 
-		log_warn("Devices file PVID %s updating IDNAME to %s.", dev->pvid, devname);
+		if (!noupdate)
+			log_warn("Devices file PVID %s updating IDNAME to %s.", dev->pvid, devname);
 
 		free(du->idname);
 		free(du->devname);
@@ -2076,9 +2304,10 @@ void device_ids_find_renamed_devs(struct cmd_context *cmd, struct dm_list *dev_l
 
 		if (!cmd->filter->passes_filter(cmd, cmd->filter, dev, NULL)) {
 			/* I don't think this would happen */
-			log_warn("WARNING: new device %s for PVID %s does not pass filter %s.",
+			log_warn("WARNING: new device %s for PVID %s is excluded: %s.",
 				 dev_name(dev), dil->pvid, dev_filtered_reason(dev));
-			du->dev = NULL;
+			if (du) /* Should not happen 'du' is NULL */
+				du->dev = NULL;
 			dev->flags &= ~DEV_MATCHED_USE_ID;
 		}
 	}
@@ -2247,7 +2476,7 @@ static int _lock_devices_file(struct cmd_context *cmd, int mode, int nonblock, i
 	fd = open(_devices_lockfile, O_CREAT|O_RDWR, S_IRUSR | S_IWUSR);
 	if (fd < 0) {
 		log_debug("lock_devices_file open errno %d", errno);
-		if (cmd->sysinit)
+		if (cmd->sysinit || cmd->ignorelockingfailure)
 			return 1;
 		return 0;
 	}
@@ -2263,7 +2492,7 @@ static int _lock_devices_file(struct cmd_context *cmd, int mode, int nonblock, i
 
 	if (close(fd))
 		stack;
-	if (cmd->sysinit)
+	if (cmd->sysinit || cmd->ignorelockingfailure)
 		return 1;
 	return 0;
 }

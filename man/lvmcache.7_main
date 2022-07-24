@@ -240,18 +240,59 @@ The writecache block size should be chosen to match the xfs sectsz value.
 It is also possible to specify a sector size of 4096 to mkfs.xfs when
 creating the file system.  In this case the writecache block size of 4096
 can be used.
+.P
+The writecache block size is displayed by the command:
+.br
+lvs -o writecacheblocksize VG/LV
+.P
+.SS dm-writecache memory usage
+.P
+The amount of main system memory used by dm-writecache can be a factor
+when selecting the writecache cachevol size and the writecache block size.
+.P
+.IP \[bu] 2
+writecache block size 4096: each 100 GiB of writecache cachevol uses
+slighly over 2 GiB of system memory.
+.IP \[bu] 2
+writecache block size 512: each 100 GiB of writecache cachevol uses
+a little over 16 GiB of system memory.
 .
 .SS dm-writecache settings
 .
-Tunable parameters can be passed to the dm-writecache kernel module using
-the --cachesettings option when caching is started, e.g.
+To specify dm-writecache tunable settings on the command line, use:
+.br
+--cachesettings 'option=N' or
+.br
+--cachesettings 'option1=N option2=N ...'
+.P
+For example, --cachesettings 'high_watermark=90 writeback_jobs=4'.
+.P
+To include settings when caching is started, run:
 .P
 .nf
 # lvconvert --type writecache --cachevol fast \\
-	--cachesettings 'high_watermark=N writeback_jobs=N' vg/main
+	--cachesettings 'option=N' vg/main
 .fi
 .P
-Tunable options are:
+To change settings for an existing writecache, run:
+.P
+.nf
+# lvchange --cachesettings 'option=N' vg/main
+.fi
+.P
+To clear all settings that have been applied, run:
+.P
+.nf
+# lvchange --cachesettings '' vg/main
+.fi
+.P
+To view the settings that are applied to a writecache LV, run:
+.P
+.nf
+# lvs -o cachesettings vg/main
+.fi
+.P
+Tunable settings are:
 .
 .TP
 high_watermark = <percent>
@@ -299,6 +340,41 @@ perform.  If not done beforehand, the splitcache command enables the
 cleaner mode and waits for flushing to complete before detaching the
 writecache.  Adding cleaner=0 to the splitcache command will skip the
 cleaner mode, and any required flushing is performed in device suspend.
+
+.SS dm-writecache using metadata profiles
+.
+In addition to specifying writecache settings on the command line, they
+can also be set in lvm.conf, or in a profile file, using the
+allocation/cache_settings/writecache config structure shown below.
+.P
+It's possible to prepare a number of different profile files in the
+\fI#DEFAULT_SYS_DIR#/profile\fP directory and specify the file name
+of the profile when starting writecache.
+.P
+.I Example
+.nf
+# cat <<EOF > #DEFAULT_SYS_DIR#/profile/cache_writecache.profile
+allocation {
+.RS
+cache_settings {
+.RS
+writecache {
+.RS
+high_watermark=60
+writeback_jobs=1024
+.RE
+}
+.RE
+}
+.RE
+}
+EOF
+.P
+
+# lvcreate -an -L10G --name fast vg /dev/fast_ssd
+# lvcreate --type writecache -L10G --name main  --cachevol fast \\
+   --metadataprofile cache_writecache vg /dev/slow_hdd
+.fi
 .
 .SS dm-cache with separate data and metadata LVs
 .

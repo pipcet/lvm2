@@ -371,7 +371,7 @@ struct format_type {
 	struct labeller *labeller;
 	const char *name;
 	const char *alias;
-	const char *orphan_vg_name;
+	char orphan_vg_name[ID_LEN];
 	struct volume_group *orphan_vg; /* Only one ever exists. */
 	uint32_t features;
 	void *library;
@@ -1034,6 +1034,7 @@ struct lvcreate_params {
 	int approx_alloc;     /* all */
 	alloc_policy_t alloc; /* all */
 	struct dm_vdo_target_params vdo_params; /* vdo */
+	uint64_t vdo_pool_header_size; /* VDO */
 
 	int raidintegrity;
 	const char *raidintegritymode;
@@ -1364,14 +1365,17 @@ const char *get_vdo_write_policy_name(enum dm_vdo_write_policy policy);
 uint64_t get_vdo_pool_virtual_size(const struct lv_segment *vdo_pool_seg);
 int update_vdo_pool_virtual_size(struct lv_segment *vdo_pool_seg);
 int parse_vdo_pool_status(struct dm_pool *mem, const struct logical_volume *vdo_pool_lv,
-			  const char *params, struct lv_status_vdo *status);
+			  const char *params, const struct dm_info *dminfo,
+			  struct lv_status_vdo *status);
 struct logical_volume *convert_vdo_pool_lv(struct logical_volume *data_lv,
 					   const struct dm_vdo_target_params *vtp,
 					   uint32_t *virtual_extents,
-					   int format);
+					   int format,
+					   uint64_t vdo_pool_header_size);
 int set_vdo_write_policy(enum dm_vdo_write_policy *vwp, const char *policy);
 int fill_vdo_target_params(struct cmd_context *cmd,
 			   struct dm_vdo_target_params *vtp,
+			   uint64_t *vdo_pool_header_size,
 			   struct profile *profile);
 /* --  metadata/vdo_manip.c */
 

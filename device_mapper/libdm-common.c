@@ -338,6 +338,7 @@ struct dm_task *dm_task_create(int type)
 	dmt->new_uuid = 0;
 	dmt->secure_data = 0;
 	dmt->record_timestamp = 0;
+	dmt->ima_measurement = 0;
 
 	return dmt;
 }
@@ -1445,7 +1446,7 @@ struct node_op_parms {
 	char *old_name;
 	int warn_if_udev_failed;
 	unsigned rely_on_udev;
-	char names[];
+	char names[0];
 };
 
 static void _store_str(char **pos, char **ptr, const char *str)
@@ -1920,7 +1921,7 @@ static int _sysfs_find_kernel_name(uint32_t major, uint32_t minor, char *buf, si
 			continue;
 
 		if ((sz = dm_snprintf(path, sizeof(path), "%sblock/%s/dev",
-				      _sysfs_dir, name)) == -1) {
+				      _sysfs_dir, name)) < 5) {
 			log_warn("Couldn't create path for %s.", name);
 			continue;
 		}

@@ -186,7 +186,7 @@ static int _lockd_result(daemon_reply reply, int *result, uint32_t *lockd_flags)
 static daemon_reply _lockd_send_with_pvs(const char *req_name,
 				const struct lvmlockd_pvs *lock_pvs, ...)
 {
-	daemon_reply repl;
+	daemon_reply repl = { .error = -1 };
 	daemon_request req;
 	int i;
 	char key[32];
@@ -201,18 +201,23 @@ static daemon_reply _lockd_send_with_pvs(const char *req_name,
 
 	/* Pass PV list */
 	if (lock_pvs && lock_pvs->num) {
-		daemon_request_extend(req, "path_num = " FMTd64,
-				      (int64_t)(lock_pvs)->num, NULL);
-
+		if (!daemon_request_extend(req, "path_num = " FMTd64,
+					   (int64_t)(lock_pvs)->num, NULL)) {
+			log_error("Failed to create pvs request.");
+			goto bad;
+		}
 		for (i = 0; i < lock_pvs->num; i++) {
 			snprintf(key, sizeof(key), "path[%d] = %%s", i);
 			val = lock_pvs->path[i] ? lock_pvs->path[i] : "none";
-			daemon_request_extend(req, key, val, NULL);
+			if (!daemon_request_extend(req, key, val, NULL)) {
+				log_error("Failed to create pvs request.");
+				goto bad;
+			}
 		}
 	}
 
 	repl = daemon_send(_lvmlockd, req);
-
+bad:
 	daemon_request_destroy(req);
 
 	return repl;
@@ -230,6 +235,18 @@ static int _lockd_retrive_vg_pv_num(struct volume_group *vg)
 		num++;
 
 	return num;
+}
+
+static void _lockd_free_pv_list(struct lvmlockd_pvs *lock_pvs)
+{
+	int i;
+
+	for (i = 0; i < lock_pvs->num; i++)
+		free(lock_pvs->path[i]);
+
+	free(lock_pvs->path);
+	lock_pvs->path = NULL;
+	lock_pvs->num = 0;
 }
 
 static void _lockd_retrive_vg_pv_list(struct volume_group *vg,
@@ -255,27 +272,18 @@ static void _lockd_retrive_vg_pv_list(struct volume_group *vg,
 
 	i = 0;
 	dm_list_iterate_items(pvl, &vg->pvs) {
+		if (!pvl->pv->dev || dm_list_empty(&pvl->pv->dev->aliases))
+			continue;
 		lock_pvs->path[i] = strdup(pv_dev_name(pvl->pv));
 		if (!lock_pvs->path[i]) {
 			log_error("Fail to allocate PV path for VG %s", vg->name);
-			goto fail;
+			_lockd_free_pv_list(lock_pvs);
+			return;
 		}
 
 		log_debug("VG %s find PV device %s", vg->name, lock_pvs->path[i]);
-		i++;
+		lock_pvs->num = ++i;
 	}
-
-	lock_pvs->num = pv_num;
-	return;
-
-fail:
-	for (i = 0; i < pv_num; i++) {
-		if (!lock_pvs->path[i])
-			continue;
-		free(lock_pvs->path[i]);
-	}
-	free(lock_pvs->path);
-	return;
 }
 
 static int _lockd_retrive_lv_pv_num(struct volume_group *vg,
@@ -327,7 +335,7 @@ static void _lockd_retrive_lv_pv_list(struct volume_group *vg,
 	}
 
 	/* Allocate buffer for PV list */
-	lock_pvs->path = malloc(sizeof(*lock_pvs->path) * pv_num);
+	lock_pvs->path = zalloc(sizeof(*lock_pvs->path) * pv_num);
 	if (!lock_pvs->path) {
 		log_error("Fail to allocate PV list for %s/%s", vg->name, lv_name);
 		return;
@@ -335,47 +343,21 @@ static void _lockd_retrive_lv_pv_list(struct volume_group *vg,
 
 	dm_list_iterate_items(pvl, &vg->pvs) {
 		if (lv_is_on_pv(lv, pvl->pv)) {
+			if (!pvl->pv->dev || dm_list_empty(&pvl->pv->dev->aliases))
+				continue;
 			lock_pvs->path[i] = strdup(pv_dev_name(pvl->pv));
 			if (!lock_pvs->path[i]) {
 				log_error("Fail to allocate PV path for LV %s/%s",
 					  vg->name, lv_name);
-				goto fail;
+				_lockd_free_pv_list(lock_pvs);
+				return;
 			}
 
 			log_debug("Find PV device %s for LV %s/%s",
 				  lock_pvs->path[i], vg->name, lv_name);
-			i++;
+			lock_pvs->num = ++i;
 		}
 	}
-
-	lock_pvs->num = pv_num;
-	return;
-
-fail:
-	for (i = 0; i < pv_num; i++) {
-		if (!lock_pvs->path[i])
-			continue;
-		free(lock_pvs->path[i]);
-		lock_pvs->path[i] = NULL;
-	}
-	free(lock_pvs->path);
-	lock_pvs->path = NULL;
-	lock_pvs->num = 0;
-	return;
-}
-
-static void _lockd_free_pv_list(struct lvmlockd_pvs *lock_pvs)
-{
-	int i;
-
-	for (i = 0; i < lock_pvs->num; i++) {
-		free(lock_pvs->path[i]);
-		lock_pvs->path[i] = NULL;
-	}
-
-	free(lock_pvs->path);
-	lock_pvs->path = NULL;
-	lock_pvs->num = 0;
 }
 
 /*
@@ -525,7 +507,7 @@ static int _create_sanlock_lv(struct cmd_context *cmd, struct volume_group *vg,
 		.read_ahead = DM_READ_AHEAD_NONE,
 		.stripes = 1,
 		.vg_name = vg->name,
-		.lv_name = dm_pool_strdup(cmd->mem, lock_lv_name),
+		.lv_name = lock_lv_name,
 		.zero = 1,
 	};
 

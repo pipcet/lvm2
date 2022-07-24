@@ -38,11 +38,64 @@ pvs
 not grep scan: $HINTS
 
 #
+# test --nohints option
+#
+
+pvcreate "$dev1"
+pvcreate "$dev2"
+# pvs --nohints does not create hints
+pvs --nohints |tee out
+grep "$dev1" out
+grep "$dev2" out
+not grep "$dev1" $HINTS
+not grep "$dev2" $HINTS
+# pvs creates hints
+pvs
+grep "$dev1" $HINTS
+grep "$dev2" $HINTS
+
+# save hints with dev1 and dev2 before dev3 is created
+cp $HINTS $PREV
+# pvcreate --nohints invalidates hints
+pvcreate --nohints "$dev3"
+ls $NEWHINTS
+# pvs --nohints does not update hints
+pvs --nohints |tee out
+grep "$dev1" out
+grep "$dev2" out
+grep "$dev3" out
+not grep "$dev3" $HINTS
+# restore old hint file without dev3
+cp $PREV $HINTS
+# pvs --nohints does not update hints
+pvs --nohints |tee out
+grep "$dev1" out
+grep "$dev2" out
+grep "$dev3" out
+grep "$dev1" $HINTS
+grep "$dev2" $HINTS
+not grep "$dev3" $HINTS
+# pvs updates hints
+pvs |tee out
+grep "$dev1" out
+grep "$dev2" out
+grep "$dev3" out
+grep "$dev1" $HINTS
+grep "$dev2" $HINTS
+grep "$dev3" $HINTS
+
+aux wipefs_a "$dev1"
+aux wipefs_a "$dev2"
+aux wipefs_a "$dev3"
+
+#
 # vg1 uses dev1,dev2
 #
 # Test basics that PVs are in hints, not non-PV devs,
 # and that only PVs are scanned when using hints.
 #
+
+rm $HINTS
 
 vgcreate $vg1 "$dev1" "$dev2"
 lvcreate -n $lv1 -l 4 $vg1
@@ -141,6 +194,12 @@ not cat $NEWHINTS
 # Test that adding a new device and removing a device
 # causes hints to be recreated.
 #
+# with a devices file the appearance of a new device on
+# the system does not disturb lvm, so this test doesn't
+# apply
+#
+
+if ! lvmdevices; then
 
 not pvs "$dev5"
 
@@ -182,6 +241,9 @@ diff scan1 scan2
 grep devs_hash $PREV > devs_hash1
 grep devs_hash $HINTS > devs_hash2
 not diff devs_hash1 devs_hash2
+
+# end of new device test for non-devicesfile case
+fi
 
 #
 # Test that hints don't change from a bunch of commands

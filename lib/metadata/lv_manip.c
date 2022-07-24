@@ -23,7 +23,6 @@
 #include "lib/metadata/pv_alloc.h"
 #include "lib/display/display.h"
 #include "lib/metadata/segtype.h"
-#include "lib/format_text/archiver.h"
 #include "lib/activate/activate.h"
 #include "lib/datastruct/str_list.h"
 #include "lib/config/defaults.h"
@@ -1700,6 +1699,10 @@ int lv_empty(struct logical_volume *lv)
 int replace_lv_with_error_segment(struct logical_volume *lv)
 {
 	uint32_t len = lv->le_count;
+	struct segment_type *segtype;
+
+	if (!(segtype = get_segtype_from_string(lv->vg->cmd, SEG_TYPE_NAME_ERROR)))
+		return_0;
 
 	if (len && !lv_empty(lv))
 		return_0;
@@ -1718,7 +1721,7 @@ int replace_lv_with_error_segment(struct logical_volume *lv)
 
 	/* FIXME Check for any attached LVs that will become orphans e.g. mirror logs */
 
-	if (!lv_add_virtual_segment(lv, 0, len, get_segtype_from_string(lv->vg->cmd, SEG_TYPE_NAME_ERROR)))
+	if (!lv_add_virtual_segment(lv, 0, len, segtype))
 		return_0;
 
 	return 1;
@@ -2351,7 +2354,7 @@ static int _match_pv_tags(const struct dm_config_node *cling_tag_list_cn,
 	const struct dm_config_value *cv;
 	const char *str;
 	const char *tag_matched;
-	struct dm_list *tags_to_match = mem ? NULL : pv_tags ? : &pv2->tags;
+	struct dm_list *tags_to_match = mem ? NULL : pv_tags ? : ((pv2) ? &pv2->tags : NULL);
 	struct dm_str_list *sl;
 	unsigned first_tag = 1;
 
@@ -2406,7 +2409,7 @@ static int _match_pv_tags(const struct dm_config_node *cling_tag_list_cn,
 				continue;
 			}
 
-			if (!str_list_match_list(&pv1->tags, tags_to_match, &tag_matched))
+			if (tags_to_match && !str_list_match_list(&pv1->tags, tags_to_match, &tag_matched))
 				continue;
 
 			if (!pv_tags) {
@@ -5217,7 +5220,7 @@ static int _lvresize_check(struct logical_volume *lv,
 
 	if (lv_is_raid(lv) &&
 	    lp->resize == LV_REDUCE) {
-		unsigned attrs;
+		unsigned attrs = 0;
 		const struct segment_type *segtype = first_seg(lv)->segtype;
 
 		if (!segtype->ops->target_present ||
@@ -6176,7 +6179,7 @@ int lv_resize(struct logical_volume *lv,
 
 	if (lv_is_thin_pool(lock_lv)) {
 		/* Update lvm pool metadata (drop messages). */
-		if (!update_pool_lv(lock_lv, 0))
+		if (!update_pool_lv(lock_lv, 1))
 			goto_bad;
 	}
 
@@ -8074,6 +8077,10 @@ static int _should_wipe_lv(struct lvcreate_params *lp,
 	     first_seg(first_seg(lv)->pool_lv)->zero_new_blocks))
 		return 0;
 
+	/* VDO LV do not need to be zeroed */
+	if (lv_is_vdo(lv))
+		return 0;
+
 	if (warn && (lv_passes_readonly_filter(lv))) {
 		log_warn("WARNING: Read-only activated logical volume %s not zeroed.",
 			 display_lvname(lv));
@@ -8718,6 +8725,14 @@ static struct logical_volume *_lv_create_an_lv(struct volume_group *vg,
 			goto revert_new_lv;
 		}
 		lv->status &= ~LV_TEMPORARY;
+	} else if (seg_is_vdo_pool(lp)) {
+		lv->status |= LV_TEMPORARY;
+		if (!activate_lv(cmd, lv)) {
+			log_error("Aborting. Failed to activate temporary "
+				  "volume for VDO pool creation.");
+			goto revert_new_lv;
+		}
+		lv->status &= ~LV_TEMPORARY;
 	} else if (!lv_active_change(cmd, lv, lp->activate)) {
 		log_error("Failed to activate new LV %s.", display_lvname(lv));
 		goto deactivate_and_revert_new_lv;
@@ -8739,9 +8754,16 @@ static struct logical_volume *_lv_create_an_lv(struct volume_group *vg,
 	}
 
 	if (seg_is_vdo_pool(lp)) {
-		if (!convert_vdo_pool_lv(lv, &lp->vdo_params, &lp->virtual_extents, 1)) {
+		if (!convert_vdo_pool_lv(lv, &lp->vdo_params, &lp->virtual_extents,
+					 1, lp->vdo_pool_header_size)) {
 			stack;
 			goto deactivate_and_revert_new_lv;
+		}
+		if ((lv->status & LV_ACTIVATION_SKIP) &&
+		    !deactivate_lv(cmd, lv)) {
+			log_error("Aborting. Couldn't deactivate VDO LV %s with skipped activation.",
+				  display_lvname(lv));
+			return NULL; /* Let's retry on error path */
 		}
 	} else if (seg_is_cache(lp) || (origin_lv && lv_is_cache_pool(lv))) {
 		/* Finish cache conversion magic */
@@ -8771,9 +8793,35 @@ static struct logical_volume *_lv_create_an_lv(struct volume_group *vg,
 			return_NULL; /* revert? */
 
 		if (!lv_update_and_reload(lv)) {
-			/* FIXME Do a better revert */
-			log_error("Aborting. Manual intervention required.");
-			return NULL; /* FIXME: revert */
+			char name[NAME_LEN];
+
+			log_debug("Reverting created caching layer.");
+
+			tmp_lv = seg_lv(first_seg(lv), 0); /* tmp corigin */
+			pool_lv = first_seg(lv)->pool_lv;
+
+			if (!detach_pool_lv(first_seg(lv)))
+				return_NULL;
+			if (!remove_layer_from_lv(lv, tmp_lv))
+				return_NULL;
+			if (!lv_remove(tmp_lv))
+				return_NULL;
+
+			/* Either we need to preserve existing LV and remove created cache pool LV.
+			   Or we need to preserve existing cache pool LV and remove created new LV. */
+			if (origin_lv)
+				lv = pool_lv; // created cache pool to be reverted as new LV
+			else {
+				/* Cut off suffix _cpool from preserved existing cache pool */
+				if (!drop_lvname_suffix(name, pool_lv->name, "cpool")) {
+					/* likely older instance of metadata */
+					log_debug("LV %s has no suffix for cachepool (skipping rename).",
+						  display_lvname(pool_lv));
+				} else if (!lv_uniq_rename_update(cmd, pool_lv, name, 0))
+					return_NULL;
+			}
+
+			goto deactivate_and_revert_new_lv;
 		}
 	} else if (lp->snapshot) {
 		/* Deactivate zeroed COW, avoid any race usage */

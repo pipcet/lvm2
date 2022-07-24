@@ -501,6 +501,9 @@ int config_file_read_fd(struct dm_config_tree *cft, struct device *dev, dev_io_r
 			checksum_fn_t checksum_fn, uint32_t checksum,
 			int checksum_only, int no_dup_node_check)
 {
+	char namebuf[NAME_LEN + 1] __attribute__((aligned(8)));
+	int namelen = 0;
+	int bad_name = 0;
 	char *fb, *fe;
 	int r = 0;
 	int sz, use_plain_read = 1;
@@ -519,7 +522,9 @@ int config_file_read_fd(struct dm_config_tree *cft, struct device *dev, dev_io_r
 	if (!(dev->flags & DEV_REGULAR) || size2)
 		use_plain_read = 0;
 
-	if (!(buf = malloc(size + size2))) {
+	/* Ensure there is extra '\0' after end of buffer since we pass
+	 * buffer to funtions like strtoll() */
+	if (!(buf = zalloc(size + size2 + 1))) {
 		log_error("Failed to allocate circular buffer.");
 		return 0;
 	}
@@ -548,6 +553,23 @@ int config_file_read_fd(struct dm_config_tree *cft, struct device *dev, dev_io_r
 
 	fb = buf;
 
+	if (!(dev->flags & DEV_REGULAR)) {
+		memcpy(namebuf, buf, NAME_LEN);
+
+		while (namebuf[namelen] && !isspace(namebuf[namelen]) && namebuf[namelen] != '{' && namelen < (NAME_LEN - 1))
+			namelen++;
+		namebuf[namelen] = '\0';
+
+		/*
+		 * Check that the text metadata begins with a valid name.
+		 */
+		if (!validate_name(namebuf)) {
+			log_warn("WARNING: Metadata location on %s at offset %llu begins with invalid name.",
+				 dev_name(dev), (unsigned long long)offset);
+			bad_name = 1;
+		}
+	}
+
 	/*
 	 * The checksum passed in is the checksum from the mda_header
 	 * preceding this metadata.  They should always match.
@@ -557,9 +579,12 @@ int config_file_read_fd(struct dm_config_tree *cft, struct device *dev, dev_io_r
 	if (checksum_fn && checksum !=
 	    (checksum_fn(checksum_fn(INITIAL_CRC, (const uint8_t *)fb, size),
 			 (const uint8_t *)(fb + size), size2))) {
-		log_error("%s: Checksum error at offset %" PRIu64, dev_name(dev), (uint64_t) offset);
+		log_warn("WARNING: Checksum error on %s at offset %llu.", dev_name(dev), (unsigned long long)offset);
 		goto out;
 	}
+
+	if (bad_name)
+		goto out;
 
 	if (!checksum_only) {
 		fe = fb + size + size2;
@@ -909,7 +934,7 @@ static int _check_value_differs_from_default(struct cft_check_handle *handle,
 				} else {
 					str = v_def ? v_def->v.str
 						    : cfg_def_get_default_value(handle->cmd, def, CFG_TYPE_STRING, NULL);
-					diff = strcmp(str, v->v.str);
+					diff = str ? strcmp(str, v->v.str) : 0;
 				}
 				break;
 			case DM_CFG_EMPTY_ARRAY:
@@ -1144,7 +1169,7 @@ int config_def_check(struct cft_check_handle *handle)
 	*vp = 0;
 	*rp = 0;
 	if (!handle->cmd->cft_def_hash) {
-		if (!(handle->cmd->cft_def_hash = dm_hash_create(60))) {
+		if (!(handle->cmd->cft_def_hash = dm_hash_create(500))) {
 			log_error("Failed to create configuration definition hash.");
 			r = 0; goto out;
 		}

@@ -616,8 +616,7 @@ int dm_check_version(void)
 int dm_cookie_supported(void)
 {
 	return (dm_check_version() &&
-		_dm_version >= 4 &&
-		_dm_version_minor >= 15);
+		((_dm_version == 4) ? _dm_version_minor >= 15 : _dm_version > 4));
 }
 
 static int _dm_inactive_supported(void)
@@ -753,6 +752,159 @@ struct dm_deps *dm_task_get_deps(struct dm_task *dmt)
 {
 	return (struct dm_deps *) (((char *) dmt->dmi.v4) +
 				   dmt->dmi.v4->data_start);
+}
+
+
+/*
+ * Round up the ptr to an 8-byte boundary.
+ * Follow kernel pattern.
+ */
+#define ALIGN_MASK 7
+static size_t _align_val(size_t val)
+{
+	return (val + ALIGN_MASK) & ~ALIGN_MASK;
+}
+static void *_align_ptr(void *ptr)
+{
+	return (void *)_align_val((size_t)ptr);
+}
+
+static int _check_has_event_nr(void) {
+	static int _has_event_nr = -1;
+
+	if (_has_event_nr < 0)
+		_has_event_nr = dm_check_version() &&
+			((_dm_version == 4) ?  _dm_version_minor >= 38 : _dm_version > 4);
+
+	return _has_event_nr;
+}
+
+struct dm_device_list {
+	struct dm_list list;
+	unsigned count;
+	unsigned features;
+	struct dm_hash_table *uuids;
+};
+
+int dm_task_get_device_list(struct dm_task *dmt, struct dm_list **devs_list,
+			    unsigned *devs_features)
+{
+	struct dm_names *names, *names1;
+	struct dm_active_device *dm_dev, *dm_new_dev;
+	struct dm_device_list *devs;
+	unsigned next = 0;
+	uint32_t *event_nr;
+	char *uuid_ptr;
+	size_t len;
+	int cnt = 0;
+
+	*devs_list = 0;
+	*devs_features = 0;
+
+	if ((names = dm_task_get_names(dmt)) && names->dev) {
+		names1 = names;
+		if (!names->name[0])
+			cnt = -1; /* -> cnt == 0 when no device is really present */
+		do {
+			names1 = (struct dm_names *)((char *) names1 + next);
+			next = names1->next;
+			++cnt;
+		} while (next);
+	}
+
+	if (!(devs = malloc(sizeof(*devs) + (cnt ? cnt * sizeof(*dm_dev) + (char*)names1 - (char*)names + 256 : 0))))
+		return_0;
+
+	dm_list_init(&devs->list);
+	devs->count = cnt;
+	devs->uuids = NULL;
+
+	if (!cnt) {
+		/* nothing in the list -> mark all features present */
+		*devs_features |= (DM_DEVICE_LIST_HAS_EVENT_NR | DM_DEVICE_LIST_HAS_UUID);
+		goto out; /* nothing else to do */
+	}
+
+	dm_dev = (struct dm_active_device *) (devs + 1);
+
+	do {
+		names = (struct dm_names *)((char *) names + next);
+
+		dm_dev->major = MAJOR(names->dev);
+		dm_dev->minor = MINOR(names->dev);
+		dm_dev->name = (char*)(dm_dev + 1);
+		dm_dev->event_nr = 0;
+		dm_dev->uuid = NULL;
+
+		strcpy(dm_dev->name, names->name);
+		len = strlen(names->name) + 1;
+
+		dm_new_dev = _align_ptr((char*)(dm_dev + 1) + len);
+		if (_check_has_event_nr()) {
+			/* Hash for UUIDs with some more bits to reduce colision count */
+			if (!devs->uuids && !(devs->uuids = dm_hash_create(cnt * 8))) {
+				free(devs);
+				return_0;
+			}
+
+			*devs_features |= DM_DEVICE_LIST_HAS_EVENT_NR;
+			event_nr = _align_ptr(names->name + len);
+			dm_dev->event_nr = event_nr[0];
+
+			if ((event_nr[1] & DM_NAME_LIST_FLAG_HAS_UUID)) {
+				*devs_features |= DM_DEVICE_LIST_HAS_UUID;
+				uuid_ptr = _align_ptr(event_nr + 2);
+				dm_dev->uuid = (char*) dm_new_dev;
+				dm_new_dev = _align_ptr((char*)dm_new_dev + strlen(uuid_ptr) + 1);
+				strcpy(dm_dev->uuid, uuid_ptr);
+				if (!dm_hash_insert(devs->uuids, dm_dev->uuid, dm_dev))
+					return_0; // FIXME
+#if 0
+				log_debug("Active %s (%s) %d:%d event:%u",
+					  dm_dev->name, dm_dev->uuid,
+					  dm_dev->major, dm_dev->minor, dm_dev->event_nr);
+#endif
+			}
+		}
+
+		dm_list_add(&devs->list, &dm_dev->list);
+		dm_dev = dm_new_dev;
+		next = names->next;
+	} while (next);
+
+    out:
+	*devs_list = (struct dm_list *)devs;
+
+	return 1;
+}
+
+int dm_device_list_find_by_uuid(struct dm_list *devs_list, const char *uuid,
+				const struct dm_active_device **dev)
+{
+	struct dm_device_list *devs = (struct dm_device_list *) devs_list;
+	struct dm_active_device *dm_dev;
+
+	if (devs->uuids &&
+	    (dm_dev = dm_hash_lookup(devs->uuids, uuid))) {
+		if (dev)
+			*dev = dm_dev;
+		return 1;
+	}
+
+	return 0;
+}
+
+void dm_device_list_destroy(struct dm_list **devs_list)
+{
+	struct dm_device_list *devs = (struct dm_device_list *) *devs_list;
+
+	if (devs) {
+		if (devs->uuids)
+			dm_hash_destroy(devs->uuids);
+
+		free(devs);
+		*devs_list = NULL;
+	}
 }
 
 struct dm_names *dm_task_get_names(struct dm_task *dmt)
@@ -922,6 +1074,13 @@ int dm_task_skip_lockfs(struct dm_task *dmt)
 int dm_task_secure_data(struct dm_task *dmt)
 {
 	dmt->secure_data = 1;
+
+	return 1;
+}
+
+int dm_task_ima_measurement(struct dm_task *dmt)
+{
+	dmt->ima_measurement = 1;
 
 	return 1;
 }
@@ -1250,9 +1409,11 @@ static struct dm_ioctl *_flatten(struct dm_task *dmt, unsigned repeat_count)
 	/* FIXME Until resume ioctl supplies name, use dev_name for readahead */
 	if (DEV_NAME(dmt) && (dmt->type != DM_DEVICE_RESUME || dmt->minor < 0 ||
 			      dmt->major < 0))
+		/* coverity[buffer_size_warning] */
 		strncpy(dmi->name, DEV_NAME(dmt), sizeof(dmi->name));
 
 	if (DEV_UUID(dmt))
+		/* coverity[buffer_size_warning] */
 		strncpy(dmi->uuid, DEV_UUID(dmt), sizeof(dmi->uuid));
 
 	if (dmt->type == DM_DEVICE_SUSPEND)
@@ -1290,6 +1451,14 @@ static struct dm_ioctl *_flatten(struct dm_task *dmt, unsigned repeat_count)
 			goto bad;
 		}
 		dmi->flags |= DM_UUID_FLAG;
+	}
+	if (dmt->ima_measurement) {
+		if (_dm_version_minor < 45) {
+			log_error("WARNING: IMA measurement unsupported by "
+				  "kernel.  Aborting operation.");
+			goto bad;
+		}
+		dmi->flags |= DM_IMA_MEASUREMENT_FLAG;
 	}
 
 	dmi->target_count = count;
@@ -1424,8 +1593,7 @@ static int _udev_complete(struct dm_task *dmt)
 static int _check_uevent_generated(struct dm_ioctl *dmi)
 {
 	if (!dm_check_version() ||
-	    _dm_version < 4 ||
-	    _dm_version_minor < 17)
+	    ((_dm_version == 4) ? _dm_version_minor < 17 : _dm_version < 4))
 		/* can't check, assume uevent is generated */
 		return 1;
 
@@ -1486,6 +1654,7 @@ static int _create_and_load_v4(struct dm_task *dmt)
 	task->head = dmt->head;
 	task->tail = dmt->tail;
 	task->secure_data = dmt->secure_data;
+	task->ima_measurement = dmt->ima_measurement;
 
 	r = dm_task_run(task);
 
@@ -1790,23 +1959,34 @@ static int _do_dm_ioctl_unmangle_string(char *str, const char *str_name,
 static int _dm_ioctl_unmangle_names(int type, struct dm_ioctl *dmi)
 {
 	char buf[DM_NAME_LEN];
-	struct dm_names *names;
+	char buf_uuid[DM_UUID_LEN];
+	struct dm_name_list *names;
 	unsigned next = 0;
 	char *name;
 	int r = 1;
+	uint32_t *event_nr;
+	char *uuid_ptr;
+	dm_string_mangling_t mangling_mode = dm_get_name_mangling_mode();
 
 	if ((name = dmi->name))
-		r = _do_dm_ioctl_unmangle_string(name, "name", buf, sizeof(buf),
-						 dm_get_name_mangling_mode());
+		r &= _do_dm_ioctl_unmangle_string(name, "name", buf, sizeof(buf),
+						  mangling_mode);
 
 	if (type == DM_DEVICE_LIST &&
-	    ((names = ((struct dm_names *) ((char *)dmi + dmi->data_start)))) &&
+	    ((names = ((struct dm_name_list *) ((char *)dmi + dmi->data_start)))) &&
 	    names->dev) {
 		do {
-			names = (struct dm_names *)((char *) names + next);
-			r = _do_dm_ioctl_unmangle_string(names->name, "name",
-							 buf, sizeof(buf),
-							 dm_get_name_mangling_mode());
+			names = (struct dm_name_list *)((char *) names + next);
+			event_nr = _align_ptr(names->name + strlen(names->name) + 1);
+			r &= _do_dm_ioctl_unmangle_string(names->name, "name",
+							  buf, sizeof(buf), mangling_mode);
+			/* Unmangle also UUID within same loop */
+			if (_check_has_event_nr() &&
+			    (event_nr[1] & DM_NAME_LIST_FLAG_HAS_UUID)) {
+				uuid_ptr = _align_ptr(event_nr + 2);
+				r &= _do_dm_ioctl_unmangle_string(uuid_ptr, "UUID", buf_uuid,
+								  sizeof(buf_uuid), mangling_mode);
+			}
 			next = names->next;
 		} while (next);
 	}
@@ -1899,7 +2079,7 @@ static struct dm_ioctl *_do_dm_ioctl(struct dm_task *dmt, unsigned command,
 	}
 
 	log_debug_activation("dm %s %s%s %s%s%s %s%.0d%s%.0d%s"
-			     "%s[ %s%s%s%s%s%s%s%s%s] %.0" PRIu64 " %s [%u] (*%u)",
+			     "%s[ %s%s%s%s%s%s%s%s%s%s] %.0" PRIu64 " %s [%u] (*%u)",
 			     _cmd_data_v4[dmt->type].name,
 			     dmt->new_uuid ? "UUID " : "",
 			     dmi->name, dmi->uuid, dmt->newname ? " " : "",
@@ -1917,6 +2097,7 @@ static struct dm_ioctl *_do_dm_ioctl(struct dm_task *dmt, unsigned command,
 			     dmt->retry_remove ? "retryremove " : "",
 			     dmt->deferred_remove ? "deferredremove " : "",
 			     dmt->secure_data ? "securedata " : "",
+			     dmt->ima_measurement ? "ima_measurement " : "",
 			     dmt->query_inactive_table ? "inactive " : "",
 			     dmt->enable_checks ? "enablechecks " : "",
 			     dmt->sector, _sanitise_message(dmt->message),

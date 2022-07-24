@@ -28,7 +28,8 @@ static void *rt_init(void)
 
 static void rt_exit(void *fixture)
 {
-	radix_tree_destroy(fixture);
+	if (fixture)
+		radix_tree_destroy(fixture);
 }
 
 static void test_create_destroy(void *fixture)
@@ -168,6 +169,7 @@ static void test_prefix_keys_reversed(void *fixture)
 static void _gen_key(uint8_t *b, uint8_t *e)
 {
 	for (; b != e; b++)
+		/* coverity[dont_call] don't care */
 		*b = rand() % 256;
 }
 
@@ -798,7 +800,7 @@ static void __invalidate(struct radix_tree *rt, int fd)
 
 	k.parts.fd = fd;
 	radix_tree_remove_prefix(rt, k.bytes, k.bytes + sizeof(k.parts.fd));
-	radix_tree_is_well_formed(rt);
+	T_ASSERT(radix_tree_is_well_formed(rt));
 }
 
 static void test_bcache_scenario3(void *fixture)

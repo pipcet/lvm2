@@ -22,6 +22,7 @@
 #include "lib/device/bcache.h"
 #include "lib/label/label.h"
 #include "lib/commands/toolcontext.h"
+#include "device_mapper/misc/dm-ioctl.h"
 
 #ifdef BLKID_WIPING_SUPPORT
 #include <blkid.h>
@@ -34,6 +35,7 @@
 
 #include <libgen.h>
 #include <ctype.h>
+#include <dirent.h>
 
 /*
  * An nvme device has major number 259 (BLKEXT), minor number <minor>,
@@ -75,6 +77,124 @@ int dev_is_lv(struct device *dev)
 		log_sys_debug("fclose", path);
 
 	return ret;
+}
+
+int dev_is_used_by_active_lv(struct cmd_context *cmd, struct device *dev, int *used_by_lv_count,
+			     char **used_by_dm_name, char **used_by_vg_uuid, char **used_by_lv_uuid)
+{
+	char holders_path[PATH_MAX];
+	char dm_dev_path[PATH_MAX];
+	char dm_uuid[DM_UUID_LEN];
+	struct stat info;
+	DIR *d;
+	struct dirent *dirent;
+	char *holder_name;
+	int dm_dev_major, dm_dev_minor;
+	size_t lvm_prefix_len = sizeof(UUID_PREFIX) - 1;
+	size_t lvm_uuid_len = sizeof(UUID_PREFIX) - 1 + 2 * ID_LEN;
+	size_t uuid_len;
+	int used_count = 0;
+	char *used_name = NULL;
+	char *used_vgid = NULL;
+	char *used_lvid = NULL;
+
+	/*
+	 * An LV using this device will be listed as a "holder" in the device's
+	 * sysfs "holders" dir.
+	 */
+
+	if (dm_snprintf(holders_path, sizeof(holders_path), "%sdev/block/%d:%d/holders/", dm_sysfs_dir(), (int) MAJOR(dev->dev), (int) MINOR(dev->dev)) < 0) {
+		log_error("%s: dm_snprintf failed for path to holders directory.", dev_name(dev));
+		return 0;
+	}
+
+	if (!(d = opendir(holders_path)))
+		return 0;
+
+	while ((dirent = readdir(d))) {
+		if (!strcmp(".", dirent->d_name) || !strcmp("..", dirent->d_name))
+			continue;
+
+		holder_name = dirent->d_name;
+
+		/*
+		 * dirent->d_name is the dev name of the holder, e.g. "dm-1"
+		 * from this name, create path "/dev/dm-1" to run stat on.
+		 */
+		
+		if (dm_snprintf(dm_dev_path, sizeof(dm_dev_path), "%s/%s", cmd->dev_dir, holder_name) < 0)
+			continue;
+
+		/*
+		 * stat "/dev/dm-1" which is the holder of the dev we're checking
+		 * dm_dev_major:dm_dev_minor come from stat("/dev/dm-1")
+		 */
+		if (stat(dm_dev_path, &info))
+			continue;
+
+		dm_dev_major = (int)MAJOR(info.st_rdev);
+		dm_dev_minor = (int)MINOR(info.st_rdev);
+        
+		if (dm_dev_major != cmd->dev_types->device_mapper_major)
+			continue;
+
+		/*
+		 * if "dm-1" is a dm device, then check if it's an LVM LV
+		 * by reading /sys/block/<holder_name>/dm/uuid and seeing
+		 * if the uuid begins with LVM-
+		 * UUID_PREFIX is "LVM-"
+		 */
+
+		dm_uuid[0] = '\0';
+
+		if (!get_dm_uuid_from_sysfs(dm_uuid, sizeof(dm_uuid), dm_dev_major, dm_dev_minor))
+			continue;
+
+		if (!strncmp(dm_uuid, UUID_PREFIX, 4))
+			used_count++;
+
+		if (used_by_dm_name && !used_name)
+			used_name = dm_pool_strdup(cmd->mem, holder_name);
+
+		if (!used_by_vg_uuid && !used_by_lv_uuid)
+			continue;
+
+		/*
+		 * UUID for LV is either "LVM-<vg_uuid><lv_uuid>" or
+		 * "LVM-<vg_uuid><lv_uuid>-<suffix>", where vg_uuid and lv_uuid
+		 * has length of ID_LEN and suffix len is not restricted (only
+		 * restricted by whole DM UUID max len).
+		 */
+
+		uuid_len = strlen(dm_uuid);
+
+		if (((uuid_len == lvm_uuid_len) ||
+		    ((uuid_len > lvm_uuid_len) && (dm_uuid[lvm_uuid_len] == '-'))) &&
+		    !strncmp(dm_uuid, UUID_PREFIX, lvm_prefix_len)) {
+
+			if (used_by_vg_uuid && !used_vgid)
+				used_vgid = dm_pool_strndup(cmd->mem, dm_uuid + lvm_prefix_len, ID_LEN);
+
+			if (used_by_lv_uuid && !used_lvid)
+				used_lvid = dm_pool_strndup(cmd->mem, dm_uuid + lvm_prefix_len + ID_LEN, ID_LEN);
+		}
+	}
+
+	if (closedir(d))
+		log_sys_debug("closedir", holders_path);
+
+	if (used_by_lv_count)
+		*used_by_lv_count = used_count;
+	if (used_by_dm_name)
+		*used_by_dm_name = used_name;
+	if (used_by_vg_uuid)
+		*used_by_vg_uuid = used_vgid;
+	if (used_by_lv_uuid)
+		*used_by_lv_uuid = used_lvid;
+
+	if (used_count)
+		return 1;
+	return 0;
 }
 
 struct dev_types *create_dev_types(const char *proc_dir,
@@ -504,12 +624,16 @@ static int _has_partition_table(struct device *dev)
 }
 
 #ifdef UDEV_SYNC_SUPPORT
-static int _udev_dev_is_partitioned(struct dev_types *dt, struct device *dev)
+static int _dev_is_partitioned_udev(struct dev_types *dt, struct device *dev)
 {
 	struct dev_ext *ext;
 	struct udev_device *device;
 	const char *value;
 
+	/*
+	 * external_device_info_source="udev" enables these udev checks.
+	 * external_device_info_source="none" disables them.
+	 */
 	if (!(ext = dev_ext_get(dev)))
 		return_0;
 
@@ -540,21 +664,15 @@ static int _udev_dev_is_partitioned(struct dev_types *dt, struct device *dev)
 	return !strcmp(value, DEV_EXT_UDEV_DEVTYPE_DISK);
 }
 #else
-static int _udev_dev_is_partitioned(struct dev_types *dt, struct device *dev)
+static int _dev_is_partitioned_udev(struct dev_types *dt, struct device *dev)
 {
 	return 0;
 }
 #endif
 
-static int _native_dev_is_partitioned(struct dev_types *dt, struct device *dev)
+static int _dev_is_partitioned_native(struct dev_types *dt, struct device *dev)
 {
 	int r;
-
-	if (!scan_bcache)
-		return -EAGAIN;
-
-	if (!_is_partitionable(dt, dev))
-		return 0;
 
 	/* Unpartitioned DASD devices are not supported. */
 	if ((MAJOR(dev->dev) == dt->dasd_major) && dasd_is_cdl_formatted(dev))
@@ -565,16 +683,20 @@ static int _native_dev_is_partitioned(struct dev_types *dt, struct device *dev)
 	return r;
 }
 
-int dev_is_partitioned(struct dev_types *dt, struct device *dev)
+int dev_is_partitioned(struct cmd_context *cmd, struct device *dev)
 {
-	if (dev->ext.src == DEV_EXT_NONE)
-		return _native_dev_is_partitioned(dt, dev);
+	struct dev_types *dt = cmd->dev_types;
 
-	if (dev->ext.src == DEV_EXT_UDEV)
-		return _udev_dev_is_partitioned(dt, dev);
+	if (!_is_partitionable(dt, dev))
+		return 0;
 
-	log_error(INTERNAL_ERROR "Missing hook for partition table recognition "
-		  "using external device info source %s", dev_ext_name(dev));
+	if (_dev_is_partitioned_native(dt, dev) == 1)
+		return 1;
+
+	if (external_device_info_source() == DEV_EXT_UDEV) {
+		if (_dev_is_partitioned_udev(dt, dev) == 1)
+			return 1;
+	}
 
 	return 0;
 }
@@ -746,7 +868,7 @@ static int _blkid_wipe(blkid_probe probe, struct device *dev, const char *name,
 	const char *offset = NULL, *type = NULL, *magic = NULL,
 		   *usage = NULL, *label = NULL, *uuid = NULL;
 	loff_t offset_value;
-	size_t len;
+	size_t len = 0;
 
 	if (!blkid_probe_lookup_value(probe, "TYPE", &type, NULL)) {
 		if (_type_in_flag_list(type, types_to_exclude))
@@ -839,6 +961,9 @@ static int _wipe_known_signatures_with_blkid(struct device *dev, const char *nam
 
 	/* TODO: Should we check for valid dev - _dev_is_valid(dev)? */
 
+	if (dm_list_empty(&dev->aliases))
+		goto_out;
+
 	if (!(probe = blkid_new_probe_from_filename(dev_name(dev)))) {
 		log_error("Failed to create a new blkid probe for device %s.", dev_name(dev));
 		goto out;
@@ -886,14 +1011,14 @@ out:
 
 #endif /* BLKID_WIPING_SUPPORT */
 
-static int _wipe_signature(struct device *dev, const char *type, const char *name,
+static int _wipe_signature(struct cmd_context *cmd, struct device *dev, const char *type, const char *name,
 			   int wipe_len, int yes, force_t force, int *wiped,
-			   int (*signature_detection_fn)(struct device *dev, uint64_t *offset_found, int full))
+			   int (*signature_detection_fn)(struct cmd_context *cmd, struct device *dev, uint64_t *offset_found, int full))
 {
 	int wipe;
 	uint64_t offset_found = 0;
 
-	wipe = signature_detection_fn(dev, &offset_found, 1);
+	wipe = signature_detection_fn(cmd, dev, &offset_found, 1);
 	if (wipe == -1) {
 		log_error("Fatal error while trying to detect %s on %s.",
 			  type, name);
@@ -921,7 +1046,7 @@ static int _wipe_signature(struct device *dev, const char *type, const char *nam
 	return 1;
 }
 
-static int _wipe_known_signatures_with_lvm(struct device *dev, const char *name,
+static int _wipe_known_signatures_with_lvm(struct cmd_context *cmd, struct device *dev, const char *name,
 					   uint32_t types_to_exclude __attribute__((unused)),
 					   uint32_t types_no_prompt __attribute__((unused)),
 					   int yes, force_t force, int *wiped)
@@ -932,9 +1057,9 @@ static int _wipe_known_signatures_with_lvm(struct device *dev, const char *name,
 		wiped = &wiped_tmp;
 	*wiped = 0;
 
-	if (!_wipe_signature(dev, "software RAID md superblock", name, 4, yes, force, wiped, dev_is_md_component) ||
-	    !_wipe_signature(dev, "swap signature", name, 10, yes, force, wiped, dev_is_swap) ||
-	    !_wipe_signature(dev, "LUKS signature", name, 8, yes, force, wiped, dev_is_luks))
+	if (!_wipe_signature(cmd, dev, "software RAID md superblock", name, 4, yes, force, wiped, dev_is_md_component) ||
+	    !_wipe_signature(cmd, dev, "swap signature", name, 10, yes, force, wiped, dev_is_swap) ||
+	    !_wipe_signature(cmd, dev, "LUKS signature", name, 8, yes, force, wiped, dev_is_luks))
 		return 0;
 
 	return 1;
@@ -959,7 +1084,7 @@ int wipe_known_signatures(struct cmd_context *cmd, struct device *dev,
 			 "while LVM is not compiled with blkid wiping support.");
 		log_warn("WARNING: Falling back to native LVM signature detection.");
 	}
-	return _wipe_known_signatures_with_lvm(dev, name,
+	return _wipe_known_signatures_with_lvm(cmd, dev, name,
 					       types_to_exclude,
 					       types_no_prompt,
 					       yes, force, wiped);
@@ -1149,147 +1274,3 @@ int dev_is_pmem(struct dev_types *dt, struct device *dev)
 }
 #endif
 
-#ifdef UDEV_SYNC_SUPPORT
-
-/*
- * Udev daemon usually has 30s timeout to process each event by default.
- * But still, that value can be changed in udev configuration and we
- * don't have libudev API to read the actual timeout value used.
- */
-
-/* FIXME: Is this long enough to wait for udev db to get initialized?
- *
- *        Take also into consideration that this check is done for each
- *        device that is scanned so we don't want to wait for a long time
- *        if there's something wrong with udev, e.g. timeouts! With current
- *        libudev API, we can't recognize whether the event processing has
- *        not finished yet and it's still being processed or whether it has
- *        failed already due to timeout in udev - in both cases the
- *        udev_device_get_is_initialized returns 0.
- */
-#define UDEV_DEV_IS_COMPONENT_ITERATION_COUNT 100
-#define UDEV_DEV_IS_COMPONENT_USLEEP 100000
-
-static struct udev_device *_udev_get_dev(struct device *dev)
-{
-	struct udev *udev_context = udev_get_library_context();
-	struct udev_device *udev_device = NULL;
-	int initialized = 0;
-	unsigned i = 0;
-
-	if (!udev_context) {
-		log_warn("WARNING: No udev context available to check if device %s is multipath component.", dev_name(dev));
-		return NULL;
-	}
-
-	while (1) {
-		if (i >= UDEV_DEV_IS_COMPONENT_ITERATION_COUNT)
-			break;
-
-		if (udev_device)
-			udev_device_unref(udev_device);
-
-		if (!(udev_device = udev_device_new_from_devnum(udev_context, 'b', dev->dev))) {
-			log_warn("WARNING: Failed to get udev device handler for device %s.", dev_name(dev));
-			return NULL;
-		}
-
-#ifdef HAVE_LIBUDEV_UDEV_DEVICE_GET_IS_INITIALIZED
-		if ((initialized = udev_device_get_is_initialized(udev_device)))
-			break;
-#else
-		if ((initialized = (udev_device_get_property_value(udev_device, DEV_EXT_UDEV_DEVLINKS) != NULL)))
-			break;
-#endif
-
-		log_debug("Device %s not initialized in udev database (%u/%u, %u microseconds).", dev_name(dev),
-			   i + 1, UDEV_DEV_IS_COMPONENT_ITERATION_COUNT,
-			   i * UDEV_DEV_IS_COMPONENT_USLEEP);
-
-		if (!udev_sleeping())
-			break;
-
-		usleep(UDEV_DEV_IS_COMPONENT_USLEEP);
-		i++;
-	}
-
-	if (!initialized) {
-		log_warn("WARNING: Device %s not initialized in udev database even after waiting %u microseconds.",
-			  dev_name(dev), i * UDEV_DEV_IS_COMPONENT_USLEEP);
-		goto out;
-	}
-
-out:
-	return udev_device;
-}
-
-int udev_dev_is_mpath_component(struct device *dev)
-{
-	struct udev_device *udev_device;
-	const char *value;
-	int ret = 0;
-
-	if (!obtain_device_list_from_udev())
-		return 0;
-
-	if (!(udev_device = _udev_get_dev(dev)))
-		return 0;
-
-	value = udev_device_get_property_value(udev_device, DEV_EXT_UDEV_BLKID_TYPE);
-	if (value && !strcmp(value, DEV_EXT_UDEV_BLKID_TYPE_MPATH)) {
-		log_debug("Device %s is multipath component based on blkid variable in udev db (%s=\"%s\").",
-			   dev_name(dev), DEV_EXT_UDEV_BLKID_TYPE, value);
-		ret = 1;
-		goto out;
-	}
-
-	value = udev_device_get_property_value(udev_device, DEV_EXT_UDEV_MPATH_DEVICE_PATH);
-	if (value && !strcmp(value, "1")) {
-		log_debug("Device %s is multipath component based on multipath variable in udev db (%s=\"%s\").",
-			   dev_name(dev), DEV_EXT_UDEV_MPATH_DEVICE_PATH, value);
-		ret = 1;
-		goto out;
-	}
-out:
-	udev_device_unref(udev_device);
-	return ret;
-}
-
-int udev_dev_is_md_component(struct device *dev)
-{
-	struct udev_device *udev_device;
-	const char *value;
-	int ret = 0;
-
-	if (!obtain_device_list_from_udev())
-		return 0;
-
-	if (!(udev_device = _udev_get_dev(dev)))
-		return 0;
-
-	value = udev_device_get_property_value(udev_device, DEV_EXT_UDEV_BLKID_TYPE);
-	if (value && !strcmp(value, DEV_EXT_UDEV_BLKID_TYPE_SW_RAID)) {
-		log_debug("Device %s is md raid component based on blkid variable in udev db (%s=\"%s\").",
-			   dev_name(dev), DEV_EXT_UDEV_BLKID_TYPE, value);
-		dev->flags |= DEV_IS_MD_COMPONENT;
-		ret = 1;
-		goto out;
-	}
-out:
-	udev_device_unref(udev_device);
-	return ret;
-}
-
-#else
-
-int udev_dev_is_mpath_component(struct device *dev)
-{
-	return 0;
-}
-
-int udev_dev_is_md_component(struct device *dev)
-{
-	return 0;
-}
-
-#endif

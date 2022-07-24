@@ -17,6 +17,7 @@
 #include "lib/format_text/format-text.h"
 #include "lib/label/hints.h"
 #include "lib/device/device_id.h"
+#include "lib/device/online.h"
 
 #include <sys/stat.h>
 #include <signal.h>
@@ -49,7 +50,7 @@ int become_daemon(struct cmd_context *cmd, int skip_lvm)
 	int null_fd;
 	pid_t pid;
 	struct sigaction act = {
-		{_sigchld_handler},
+		.sa_handler = _sigchld_handler,
 		.sa_flags = SA_NOCLDSTOP,
 	};
 
@@ -111,6 +112,8 @@ int become_daemon(struct cmd_context *cmd, int skip_lvm)
 			_exit(ECMD_FAILED);
 	}
 
+	/* coverity[leaked_handle] null_fd does not leak here */
+
 	return 1;
 }
 
@@ -123,7 +126,7 @@ const char *skip_dev_dir(struct cmd_context *cmd, const char *vg_name,
 	size_t devdir_len = strlen(cmd->dev_dir);
 	const char *dmdir = dm_dir() + devdir_len;
 	size_t dmdir_len = strlen(dmdir), vglv_sz;
-	char *vgname, *lvname, *layer, *vglv;
+	char *vgname = NULL, *lvname, *layer, *vglv;
 
 	/* FIXME Do this properly */
 	if (*vg_name == '/')
@@ -675,7 +678,7 @@ int vgcreate_params_set_from_args(struct cmd_context *cmd,
 			}
 
 		} else {
-			log_error("Using a shared lock type requires lvmlockd.");
+			log_error("Using a shared lock type requires lvmlockd (lvm.conf use_lvmlockd.)");
 			return 0;
 		}
 
@@ -811,6 +814,27 @@ int lv_change_activate(struct cmd_context *cmd, struct logical_volume *lv,
 		lv_clear_integrity_recalculate_metadata(lv);
 	}
 
+	/*
+	 * When LVs are deactivated, then autoactivation of the VG is
+	 * "re-armed" by removing the vg online file.  So, after deactivation
+	 * of LVs, if PVs are disconnected and reconnected again, event
+	 * activation will trigger autoactivation again.  This secondary
+	 * autoactivation is somewhat different from, and not as important as
+	 * the initial autoactivation during system startup.  The secondary
+	 * autoactivation will happen to a VG on a running system and may be
+	 * mixing with user commands, so the end result is unpredictable.
+	 *
+	 * It's possible that we might want a config setting for usersto  
+	 * disable secondary autoactivations.  Once a system is up, the
+	 * user may want to take charge of activation changes to the VG
+	 * and not have the system autoactivation interfere.
+	 */
+	if (!is_change_activating(activate) && cmd->event_activation &&
+	    !cmd->online_vg_file_removed) {
+		cmd->online_vg_file_removed = 1;
+		online_vg_file_remove(lv->vg->name);
+	}
+
 	set_lv_notify(lv->vg->cmd);
 
 	return r;
@@ -875,6 +899,10 @@ void lv_spawn_background_polling(struct cmd_context *cmd,
 {
 	const char *pvname;
 	const struct logical_volume *lv_mirr = NULL;
+
+	/* Ensure there is nothing waiting on cookie */
+	if (!sync_local_dev_names(cmd))
+		log_warn("Failed to sync local dev names.");
 
 	if (lv_is_pvmove(lv))
 		lv_mirr = lv;
@@ -1172,6 +1200,183 @@ out:
 	return ok;
 }
 
+/*
+ * Compare VDO option name, skip any '_' in name
+ * and also allow to use it without  vdo_[use_] prefix
+ */
+static int _compare_vdo_option(const char *b1, const char *b2)
+{
+	if (strncasecmp(b1, "vdo", 3) == 0) // skip vdo prefix
+		b1 += 3;
+
+	if ((tolower(*b1) != tolower(*b2)) &&
+	    (strncmp(b2, "use_", 4) == 0))
+		b2 += 4;  // try again with skipped prefix 'use_'
+
+	while (*b1 && *b2) {
+		if (tolower(*b1) == tolower(*b2)) {
+			++b1;
+			++b2;
+			continue;	// matching char
+		}
+
+		if (*b1 == '_')
+			++b1;           // skip to next char
+		else if (*b2 == '_')
+			++b2;           // skip to next char
+		else
+			break;          // mismatch
+	}
+
+	return (*b1 || *b2) ? 0 : 1;
+}
+
+#define CHECK_AND_SET(var, onoff) \
+	option = #var;\
+	if (_compare_vdo_option(cn->key, option)) {\
+		if (is_lvchange || !cn->v || (cn->v->type != DM_CFG_INT))\
+			goto err;\
+		if (vtp->var != cn->v->v.i) {\
+			vtp->var = cn->v->v.i;\
+			u |= onoff;\
+		}\
+		continue;\
+	}
+
+#define DO_OFFLINE(var) \
+	CHECK_AND_SET(var, VDO_CHANGE_OFFLINE)
+
+#define DO_ONLINE(var) \
+	CHECK_AND_SET(var, VDO_CHANGE_ONLINE)
+
+int get_vdo_settings(struct cmd_context *cmd,
+		     struct dm_vdo_target_params *vtp,
+		     int *updated)
+{
+	const char *str, *option = NULL;
+	struct arg_value_group_list *group;
+	struct dm_config_tree *result = NULL, *prev = NULL, *current = NULL;
+	struct dm_config_node *cn;
+	int r = 0, u = 0, is_lvchange;
+	int use_compression = vtp->use_compression;
+	int use_deduplication = vtp->use_deduplication;
+	int checked_lvchange;
+
+	if (updated)
+		*updated = 0;
+
+	// Group all --vdosettings
+	dm_list_iterate_items(group, &cmd->arg_value_groups) {
+		if (!grouped_arg_is_set(group->arg_values, vdosettings_ARG))
+			continue;
+
+		if (!(current = dm_config_create()))
+			goto_out;
+		if (prev)
+			current->cascade = prev;
+		prev = current;
+
+		if (!(str = grouped_arg_str_value(group->arg_values,
+						  vdosettings_ARG,
+						  NULL)))
+			goto_out;
+
+		if (!dm_config_parse_without_dup_node_check(current, str, str + strlen(str)))
+			goto_out;
+	}
+
+	if (current) {
+		if (!(result = dm_config_flatten(current)))
+			goto_out;
+
+		checked_lvchange = !strcmp(cmd->name, "lvchange");
+
+		/* Use all acceptable VDO options */
+		for (cn = result->root; cn; cn = cn->sib) {
+			is_lvchange = 0;
+			DO_OFFLINE(ack_threads);
+			DO_OFFLINE(bio_rotation);
+			DO_OFFLINE(bio_threads);
+			DO_OFFLINE(block_map_cache_size_mb);
+			DO_OFFLINE(block_map_era_length);
+			DO_OFFLINE(block_map_period); // alias for block_map_era_length
+			DO_OFFLINE(cpu_threads);
+			DO_OFFLINE(hash_zone_threads);
+			DO_OFFLINE(logical_threads);
+			DO_OFFLINE(max_discard);
+			DO_OFFLINE(physical_threads);
+
+			// Support also these - even when we have regular opts for them
+			DO_ONLINE(use_compression);
+			DO_ONLINE(use_deduplication);
+
+			// Settings bellow cannot be changed with lvchange command
+			is_lvchange = checked_lvchange;
+
+			DO_OFFLINE(check_point_frequency);
+			DO_OFFLINE(index_memory_size_mb);
+			DO_OFFLINE(minimum_io_size);
+			DO_OFFLINE(slab_size_mb);
+			DO_OFFLINE(use_metadata_hints);
+			DO_OFFLINE(use_sparse_index);
+
+			option = "write_policy";
+			if (_compare_vdo_option(cn->key, option)) {
+				if (is_lvchange || !cn->v || (cn->v->type != DM_CFG_STRING))
+					goto err;
+				if (!set_vdo_write_policy(&vtp->write_policy, cn->v->v.str))
+					goto_out;
+				u |= VDO_CHANGE_OFFLINE;
+				continue;
+			}
+
+			log_error("Unknown VDO setting \"%s\".", cn->key);
+			goto out;
+		}
+	}
+
+	if (arg_is_set(cmd, compression_ARG)) {
+		vtp->use_compression = arg_int_value(cmd, compression_ARG, 0);
+		if (vtp->use_compression != use_compression)
+			u |= VDO_CHANGE_ONLINE;
+	}
+
+	if (arg_is_set(cmd, deduplication_ARG)) {
+		vtp->use_deduplication = arg_int_value(cmd, deduplication_ARG, 0);
+		if (vtp->use_deduplication != use_deduplication)
+			u |= VDO_CHANGE_ONLINE;
+	}
+
+	if (updated) {
+		// validation of updated VDO option
+		if (!dm_vdo_validate_target_params(vtp, 0 /* vdo_size */)) {
+err:
+			if (is_lvchange)
+				log_error("Cannot change VDO setting \"vdo_%s\" in existing VDO pool.",
+					  option);
+			else
+				log_error("Invalid argument for VDO setting \"vdo_%s\".",
+					  option);
+			goto out;
+		}
+
+		*updated = u;
+	}
+
+	r = 1;
+out:
+	if (result)
+		dm_config_destroy(result);
+
+	while (prev) {
+		current = prev->cascade;
+		dm_config_destroy(prev);
+		prev = current;
+	}
+
+	return r;
+}
+
 static int _get_one_writecache_setting(struct cmd_context *cmd, struct writecache_settings *settings,
 				       char *key, char *val, uint32_t *block_size_sectors)
 {
@@ -1289,12 +1494,15 @@ static int _get_one_writecache_setting(struct cmd_context *cmd, struct writecach
 int get_writecache_settings(struct cmd_context *cmd, struct writecache_settings *settings,
 			    uint32_t *block_size_sectors)
 {
+	const struct dm_config_node *cns, *cn1, *cn2;
 	struct arg_value_group_list *group;
 	const char *str;
 	char key[64];
 	char val[64];
 	int num;
 	int pos;
+	int rn;
+	int found = 0;
 
 	/*
 	 * "grouped" means that multiple --cachesettings options can be used.
@@ -1326,8 +1534,51 @@ int get_writecache_settings(struct cmd_context *cmd, struct writecache_settings 
 			if (!_get_one_writecache_setting(cmd, settings, key, val, block_size_sectors))
 				return_0;
 		}
+		found = 1;
 	}
 
+	if (found)
+		goto out;
+
+	/*
+	 * If there were no settings on the command line, look for settings in
+	 * lvm.conf
+	 *
+	 * TODO: support profiles
+	 */
+
+	if (!(cns = find_config_tree_node(cmd, allocation_cache_settings_CFG_SECTION, NULL)))
+		goto out;
+
+	for (cn1 = cns->child; cn1; cn1 = cn1->sib) {
+		if (!cn1->child)
+			continue; /* Ignore section without settings */
+
+		if (cn1->v || strcmp(cn1->key, "writecache") != 0)
+			continue; /* Ignore non-matching settings */
+
+		cn2 = cn1->child;
+
+		for (; cn2; cn2 = cn2->sib) {
+			memset(val, 0, sizeof(val));
+
+			if (cn2->v->type == DM_CFG_INT)
+				rn = dm_snprintf(val, sizeof(val), FMTd64, cn2->v->v.i);
+			else if (cn2->v->type == DM_CFG_STRING)
+				rn = dm_snprintf(val, sizeof(val), "%s", cn2->v->v.str);
+			else
+				rn = -1;
+			if (rn < 0) {
+				log_error("Invalid lvm.conf writecache setting value for %s.", cn2->key);
+				return 0;
+			}
+
+			if (!_get_one_writecache_setting(cmd, settings, (char *)cn2->key, val, block_size_sectors))
+				return_0;
+		}
+	}
+
+ out:
 	if (settings->high_watermark_set && settings->low_watermark_set &&
 	    (settings->high_watermark <= settings->low_watermark)) {
 		log_error("High watermark must be greater than low watermark.");
@@ -1414,7 +1665,7 @@ int process_each_label(struct cmd_context *cmd, int argc, char **argv,
 				goto out;
 			}
 
-			if (!(dev = dev_cache_get(cmd, argv[opt], cmd->filter))) {
+			if (!(dev = dev_cache_get_existing(cmd, argv[opt], cmd->filter))) {
 				log_error("Failed to find device "
 					  "\"%s\".", argv[opt]);
 				ret_max = ECMD_FAILED;
@@ -1461,7 +1712,7 @@ int process_each_label(struct cmd_context *cmd, int argc, char **argv,
 			/*
 			 * add info to lvmcache from the duplicate dev.
 			 */
-			label_scan_dev(devl->dev);
+			label_scan_dev(cmd, devl->dev);
 
 			/*
 			 * the info/label should now be found because
@@ -2962,6 +3213,8 @@ int process_each_lv_in_vg(struct cmd_context *cmd, struct volume_group *vg,
 	struct glv_list *glvl, *tglvl;
 	int do_report_ret_code = 1;
 
+	cmd->online_vg_file_removed = 0;
+
 	log_set_report_object_type(LOG_REPORT_OBJECT_TYPE_LV);
 
 	vg_uuid[0] = '\0';
@@ -3096,8 +3349,7 @@ int process_each_lv_in_vg(struct cmd_context *cmd, struct volume_group *vg,
 	 * in bcache, and needs to be closed so the open fd doesn't
 	 * interfere with processing the LV.
 	 */
-	dm_list_iterate_items(lvl, &final_lvs)
-		label_scan_invalidate_lv(cmd, lvl->lv);
+	label_scan_invalidate_lvs(cmd, &final_lvs);
 
 	dm_list_iterate_items(lvl, &final_lvs) {
 		lv_uuid[0] = '\0';
@@ -3170,7 +3422,7 @@ int process_each_lv_in_vg(struct cmd_context *cmd, struct volume_group *vg,
 	log_set_report_object_name_and_id(NULL, NULL);
 
 	if (handle->include_historical_lvs && !tags_supplied) {
-		if (!dm_list_size(&_historical_lv.segments))
+		if (dm_list_empty(&_historical_lv.segments))
 			dm_list_add(&_historical_lv.segments, &_historical_lv_segment.list);
 		_historical_lv.vg = vg;
 
@@ -3195,13 +3447,14 @@ int process_each_lv_in_vg(struct cmd_context *cmd, struct volume_group *vg,
 				process_lv = 1;
 			}
 
-			process_lv = process_lv && select_match_lv(cmd, handle, vg, lvl->lv) && _select_matches(handle);
+			_historical_lv.this_glv = glvl->glv;
+			_historical_lv.name = glvl->glv->historical->name;
+
+			process_lv = process_lv && select_match_lv(cmd, handle, vg, &_historical_lv) && _select_matches(handle);
 
 			if (!process_lv)
 				continue;
 
-			_historical_lv.this_glv = glvl->glv;
-			_historical_lv.name = glvl->glv->historical->name;
 			log_very_verbose("Processing historical LV %s in VG %s.", glvl->glv->historical->name, vg->name);
 
 			ret = process_single_lv(cmd, &_historical_lv, handle);
@@ -3845,78 +4098,21 @@ static int _get_arg_devices(struct cmd_context *cmd,
 	int ret_max = ECMD_PROCESSED;
 
 	dm_list_iterate_items(sl, arg_pvnames) {
-		if (!(dil = dm_pool_alloc(cmd->mem, sizeof(*dil)))) {
+		if (!(dil = dm_pool_zalloc(cmd->mem, sizeof(*dil)))) {
 			log_error("device_id_list alloc failed.");
 			return ECMD_FAILED;
 		}
 
-		if (!(dil->dev = dev_cache_get(cmd, sl->str, cmd->filter))) {
+		if (!(dil->dev = dev_cache_get_existing(cmd, sl->str, cmd->filter))) {
 			log_error("Cannot use %s: %s", sl->str, devname_error_reason(sl->str));
 			ret_max = EINIT_FAILED;
 		} else {
-			strncpy(dil->pvid, dil->dev->pvid, ID_LEN);
+			memcpy(dil->pvid, dil->dev->pvid, ID_LEN);
 			dm_list_add(arg_devices, &dil->list);
 		}
 	}
 
 	return ret_max;
-}
-
-static int _get_all_devices(struct cmd_context *cmd,
-			    int process_all_devices,
-			    struct dm_list *all_devices)
-{
-	struct dev_iter *iter;
-	struct device *dev;
-	struct device_id_list *dil;
-	struct hint *hint;
-	int r = ECMD_FAILED;
-
-	/*
-	 * If command is using hints and is only looking for PVs
-	 * (not all devices), then we can use only devs from hints.
-	 */
-	if (!process_all_devices && !dm_list_empty(&cmd->hints)) {
-		log_debug("Getting list of all devices from hints");
-
-		dm_list_iterate_items(hint, &cmd->hints) {
-			if (!(dev = dev_cache_get(cmd, hint->name, NULL)))
-				continue;
-
-			if (!(dil = dm_pool_alloc(cmd->mem, sizeof(*dil)))) {
-				log_error("device_id_list alloc failed.");
-				return ECMD_FAILED;
-			}
-
-			strncpy(dil->pvid, hint->pvid, ID_LEN);
-			dil->dev = dev;
-			dm_list_add(all_devices, &dil->list);
-		}
-		return ECMD_PROCESSED;
-	}
-
-	log_debug("Getting list of all devices from system");
-
-	if (!(iter = dev_iter_create(cmd->filter, 1))) {
-		log_error("dev_iter creation failed.");
-		return ECMD_FAILED;
-	}
-
-	while ((dev = dev_iter_get(cmd, iter))) {
-		if (!(dil = dm_pool_alloc(cmd->mem, sizeof(*dil)))) {
-			log_error("device_id_list alloc failed.");
-			goto out;
-		}
-
-		strncpy(dil->pvid, dev->pvid, ID_LEN);
-		dil->dev = dev;
-		dm_list_add(all_devices, &dil->list);
-	}
-
-	r = ECMD_PROCESSED;
-out:
-	dev_iter_destroy(iter);
-	return r;
 }
 
 static int _device_list_remove(struct dm_list *devices, struct device *dev)
@@ -3945,47 +4141,66 @@ static struct device_id_list *_device_list_find_dev(struct dm_list *devices, str
 	return NULL;
 }
 
-static int _process_device_list(struct cmd_context *cmd, struct dm_list *all_devices,
+/* Process devices that are not PVs. */
+
+static int _process_other_devices(struct cmd_context *cmd,
 				struct processing_handle *handle,
 				process_single_pv_fn_t process_single_pv)
 {
+	struct dev_iter *iter;
 	struct physical_volume pv_dummy;
 	struct physical_volume *pv;
-	struct device_id_list *dil;
-	int ret_max = ECMD_PROCESSED;
-	int ret = 0;
+	struct device *dev;
+	int failed = 0;
+	int ret;
 
 	log_debug("Processing devices that are not PVs");
 
 	/*
-	 * Pretend that each device is a PV with dummy values.
-	 * FIXME Formalise this extension or find an alternative.
+	 * We want devices here that passed filters during
+	 * label_scan but were found to not be PVs.
+	 *
+	 * No filtering used in iter, DEV_SCAN_FOUND_NOLABEL
+	 * was set by label_scan which did filtering.
 	 */
-	dm_list_iterate_items(dil, all_devices) {
-		if (sigint_caught())
-			return_ECMD_FAILED;
+
+	if (!(iter = dev_iter_create(NULL, 0)))
+		return_0;
+
+	while ((dev = dev_iter_get(cmd, iter))) {
+		if (sigint_caught()) {
+			failed = 1;
+			break;
+		}
+
+		if (!(dev->flags & DEV_SCAN_FOUND_NOLABEL))
+			continue;
+
+		/*
+		 * Pretend that each device is a PV with dummy values.
+		 * FIXME Formalise this extension or find an alternative.
+		 */
 
 		memset(&pv_dummy, 0, sizeof(pv_dummy));
 		dm_list_init(&pv_dummy.tags);
 		dm_list_init(&pv_dummy.segments);
-		pv_dummy.dev = dil->dev;
+		pv_dummy.dev = dev;
 		pv = &pv_dummy;
 
-		log_very_verbose("Processing device %s.", dev_name(dil->dev));
+		log_very_verbose("Processing device %s.", dev_name(dev));
 
 		ret = process_single_pv(cmd, NULL, pv, handle);
-
-		if (ret > ret_max)
-			ret_max = ret;
+		if (ret != ECMD_PROCESSED)
+			failed = 1;
 	}
+	dev_iter_destroy(iter);
 
-	return ECMD_PROCESSED;
+	return failed ? 0 : 1;
 }
 
 static int _process_duplicate_pvs(struct cmd_context *cmd,
-				  struct dm_list *all_devices,
 				  struct dm_list *arg_devices,
-				  int process_all_devices,
+				  int process_other_devices,
 				  struct processing_handle *handle,
 				  process_single_pv_fn_t process_single_pv)
 {
@@ -3995,8 +4210,8 @@ static int _process_duplicate_pvs(struct cmd_context *cmd,
 	struct lvmcache_info *info;
 	const char *vgname;
 	const char *vgid;
-	int ret_max = ECMD_PROCESSED;
-	int ret = 0;
+	int failed = 0;
+	int ret;
 
 	struct physical_volume dummy_pv = {
 		.pe_size = 1,
@@ -4010,6 +4225,8 @@ static int _process_duplicate_pvs(struct cmd_context *cmd,
 	};
 
 	struct volume_group dummy_vg = {
+		.cmd = cmd,
+		.vgmem = cmd->mem,
 		.extent_size = 1,
 		.fid = &dummy_fid,
 		.name = "",
@@ -4023,20 +4240,15 @@ static int _process_duplicate_pvs(struct cmd_context *cmd,
 	dm_list_init(&unused_duplicate_devs);
 
 	if (!lvmcache_get_unused_duplicates(cmd, &unused_duplicate_devs))
-		return_ECMD_FAILED;
+		return_0;
 
 	dm_list_iterate_items(devl, &unused_duplicate_devs) {
 		/* Duplicates are displayed if -a is used or the dev is named as an arg. */
 
-		_device_list_remove(all_devices, devl->dev);
-
-		if (!process_all_devices && dm_list_empty(arg_devices))
-			continue;
-
 		if ((dil = _device_list_find_dev(arg_devices, devl->dev)))
 			_device_list_remove(arg_devices, devl->dev);
 
-		if (!process_all_devices && !dil)
+		if (!process_other_devices && !dil)
 			continue;
 
 		if (!(cmd->cname->flags & ENABLE_DUPLICATE_DEVS))
@@ -4065,7 +4277,7 @@ static int _process_duplicate_pvs(struct cmd_context *cmd,
 		 */
 		if (!(info = lvmcache_info_from_pvid(devl->dev->pvid, NULL, 0))) {
 			log_error(INTERNAL_ERROR "No info for pvid");
-			return ECMD_FAILED;
+			return 0;
 		}
 
 		vgname = lvmcache_vgname_from_info(info);
@@ -4081,24 +4293,21 @@ static int _process_duplicate_pvs(struct cmd_context *cmd,
 			memset(&dummy_vg.id, 0, sizeof(dummy_vg.id));
 
 		ret = process_single_pv(cmd, &dummy_vg, &dummy_pv, handle);
-
-		if (ret > ret_max)
-			ret_max = ret;
+		if (ret != ECMD_PROCESSED)
+			failed = 1;
 
 		if (sigint_caught())
-			return_ECMD_FAILED;
+			return_0;
 	}
 
-	return ECMD_PROCESSED;
+	return failed ? 0 : 1;
 }
 
 static int _process_pvs_in_vg(struct cmd_context *cmd,
 			      struct volume_group *vg,
-			      struct dm_list *all_devices,
 			      struct dm_list *arg_devices,
 			      struct dm_list *arg_tags,
 			      int process_all_pvs,
-			      int process_all_devices,
 			      int skip,
 			      uint32_t error_flags,
 			      struct processing_handle *handle,
@@ -4111,15 +4320,11 @@ static int _process_pvs_in_vg(struct cmd_context *cmd,
 	struct physical_volume *pv;
 	struct pv_list *pvl;
 	struct device_id_list *dil;
-	struct device_list *devl;
-	struct dm_list outdated_devs;
 	const char *pv_name;
 	int process_pv;
 	int do_report_ret_code = 1;
 	int ret_max = ECMD_PROCESSED;
 	int ret = 0;
-
-	dm_list_init(&outdated_devs);
 
 	log_set_report_object_type(LOG_REPORT_OBJECT_TYPE_PV);
 
@@ -4198,18 +4403,6 @@ static int _process_pvs_in_vg(struct cmd_context *cmd,
 			else
 				log_very_verbose("Processing PV %s in VG %s.", pv_name, vg->name);
 
-			_device_list_remove(all_devices, pv->dev);
-
-			/*
-			 * pv->dev should be found in all_devices unless it's a
-			 * case of a "missing device".  Previously there have
-			 * been cases where we needed to skip processing the PV
-			 * if pv->dev was not found in all_devices to avoid
-			 * processing a PV twice, i.e. when the PV had no MDAs
-			 * it would be seen once in its real VG and again
-			 * wrongly in the orphan VG.  This no longer happens.
-			 */
-
 			if (!skip) {
 				ret = process_single_pv(cmd, vg, pv, handle);
 				if (ret != ECMD_PROCESSED)
@@ -4228,11 +4421,6 @@ static int _process_pvs_in_vg(struct cmd_context *cmd,
 			break;
 		log_set_report_object_name_and_id(NULL, NULL);
 	}
-
-	if (!is_orphan_vg(vg->name))
-		lvmcache_get_outdated_devs(cmd, vg->name, (const char *)&vg->id, &outdated_devs);
-	dm_list_iterate_items(devl, &outdated_devs)
-		_device_list_remove(all_devices, devl->dev);
 
 	do_report_ret_code = 0;
 out:
@@ -4253,18 +4441,15 @@ out:
  * arg_devices and arg_tags are empty, then process all PVs.
  * No PV should be processed more than once.
  *
- * Each PV is removed from arg_devices and all_devices when it is
- * processed.  Any names remaining in arg_devices were not found, and
- * should produce an error.  Any devices remaining in all_devices were
- * not found and should be processed by process_device_list().
+ * Each PV is removed from arg_devices when it is processed.
+ * Any names remaining in arg_devices were not found, and
+ * should produce an error.
  */
 static int _process_pvs_in_vgs(struct cmd_context *cmd, uint32_t read_flags,
 			       struct dm_list *all_vgnameids,
-			       struct dm_list *all_devices,
 			       struct dm_list *arg_devices,
 			       struct dm_list *arg_tags,
 			       int process_all_pvs,
-			       int process_all_devices,
 			       struct processing_handle *handle,
 			       process_single_pv_fn_t process_single_pv)
 {
@@ -4333,8 +4518,8 @@ static int _process_pvs_in_vgs(struct cmd_context *cmd, uint32_t read_flags,
 		 * error_vg->pvs entries from devices list.
 		 */
 		
-		ret = _process_pvs_in_vg(cmd, vg ? vg : error_vg, all_devices, arg_devices, arg_tags,
-					 process_all_pvs, process_all_devices, skip, error_flags,
+		ret = _process_pvs_in_vg(cmd, vg ? vg : error_vg, arg_devices, arg_tags,
+					 process_all_pvs, skip, error_flags,
 					 handle, process_single_pv);
 		if (ret != ECMD_PROCESSED)
 			stack;
@@ -4344,7 +4529,7 @@ static int _process_pvs_in_vgs(struct cmd_context *cmd, uint32_t read_flags,
 		if (ret > ret_max)
 			ret_max = ret;
 
-		if (!skip)
+		if (!skip && vg)
 			unlock_vg(cmd, vg, vg->name);
 endvg:
 		if (error_vg)
@@ -4380,10 +4565,9 @@ int process_each_pv(struct cmd_context *cmd,
 	struct dm_list arg_pvnames;	/* str_list */
 	struct dm_list arg_devices;	/* device_id_list */
 	struct dm_list all_vgnameids;	/* vgnameid_list */
-	struct dm_list all_devices;	/* device_id_list */
 	struct device_id_list *dil;
 	int process_all_pvs;
-	int process_all_devices;
+	int process_other_devices;
 	int ret_max = ECMD_PROCESSED;
 	int ret;
 
@@ -4410,7 +4594,6 @@ int process_each_pv(struct cmd_context *cmd,
 	dm_list_init(&arg_pvnames);
 	dm_list_init(&arg_devices);
 	dm_list_init(&all_vgnameids);
-	dm_list_init(&all_devices);
 
 	/*
 	 * Create two lists from argv:
@@ -4432,7 +4615,7 @@ int process_each_pv(struct cmd_context *cmd,
 
 	process_all_pvs = dm_list_empty(&arg_pvnames) && dm_list_empty(&arg_tags);
 
-	process_all_devices = process_all_pvs && (cmd->cname->flags & ENABLE_ALL_DEVS) && all_is_set;
+	process_other_devices = process_all_pvs && (cmd->cname->flags & ENABLE_ALL_DEVS) && all_is_set;
 
 	/* Needed for a current listing of the global VG namespace. */
 	if (!only_this_vgname && !lock_global(cmd, "sh")) {
@@ -4448,16 +4631,6 @@ int process_each_pv(struct cmd_context *cmd,
 		goto_out;
 	}
 
-	/*
-	 * If the caller wants to process all devices (not just PVs), then all PVs
-	 * from all VGs are processed first, removing them from all_devices.  Then
-	 * any devs remaining in all_devices are processed.
-	 */
-	if ((ret = _get_all_devices(cmd, process_all_devices, &all_devices)) != ECMD_PROCESSED) {
-		ret_max = ret;
-		goto_out;
-	}
-
 	if ((ret = _get_arg_devices(cmd, &arg_pvnames, &arg_devices)) != ECMD_PROCESSED) {
 		/* get_arg_devices reports EINIT_FAILED for any PV names not found. */
 		ret_max = ret;
@@ -4466,9 +4639,8 @@ int process_each_pv(struct cmd_context *cmd,
 		ret_max = ECMD_FAILED; /* but ATM we've returned FAILED for all cases */
 	}
 
-	ret = _process_pvs_in_vgs(cmd, read_flags, &all_vgnameids, &all_devices,
-				  &arg_devices, &arg_tags,
-				  process_all_pvs, process_all_devices,
+	ret = _process_pvs_in_vgs(cmd, read_flags, &all_vgnameids,
+				  &arg_devices, &arg_tags, process_all_pvs,
 				  handle, process_single_pv);
 	if (ret != ECMD_PROCESSED)
 		stack;
@@ -4476,58 +4648,29 @@ int process_each_pv(struct cmd_context *cmd,
 		ret_max = ret;
 
 	/*
-	 * Process the list of unused duplicate devs so they can be shown by
-	 * report/display commands.  These are the devices that were not chosen
-	 * to be used in lvmcache because another device with the same PVID was
-	 * preferred.  The unused duplicate devs are not seen by
-	 * _process_pvs_in_vgs, which only sees the preferred device for the
-	 * PVID.
-	 *
-	 * The main purpose in reporting/displaying the unused duplicate PVs
-	 * here is so that they do not appear to be unused/free devices or
-	 * orphans.
-	 *
-	 * We do not allow modifying the unused duplicate PVs.  To modify a
-	 * non-preferred duplicate PV, e.g. pvchange -u, a filter needs to be
-	 * used with the command to exclude the other devices with the same
-	 * PVID.  This results in the command seeing only the one device with
-	 * the PVID and allows it to be changed.  (If the duplicates actually
-	 * represent the same underlying storage, these precautions are
-	 * unnecessary, but lvm can't tell when the duplicates are different
-	 * paths to the same storage or different underlying storage.)
-	 *
-	 * Even the preferred duplicate PV in lvmcache is limitted from being
-	 * modified (by allow_changes_with_duplicate_pvs setting), because lvm
-	 * cannot be sure that the preferred duplicate device is the correct one,
-	 * e.g. if a VG has two PVs, and both PVs are cloned, lvm might prefer
-	 * one of the original PVs and one of the cloned PVs, pairing them
-	 * together as the VG.  Any changes on the VG or PVs in that state would
-	 * end up changing one of the original PVs and one of the cloned PVs.
-	 *
-	 * vgimportclone of the two cloned PVs changes their PV UUIDs and gives
-	 * them a new VG name.
+	 * Process the list of unused duplicate devs to display duplicate PVs
+	 * in two cases: 1. pvs -a (which has traditionally included duplicate
+	 * PVs in addition to the expected non-PV devices), 2. pvs <devname>
+	 * (duplicate dev is named on the command line.)
 	 */
-
-	ret = _process_duplicate_pvs(cmd, &all_devices, &arg_devices, process_all_devices,
-				     handle, process_single_pv);
-	if (ret != ECMD_PROCESSED)
-		stack;
-	if (ret > ret_max)
-		ret_max = ret;
+	if (process_other_devices || !dm_list_empty(&arg_devices)) {
+		if (!_process_duplicate_pvs(cmd, &arg_devices, process_other_devices, handle, process_single_pv))
+			ret_max = ECMD_FAILED;
+	}
 
 	dm_list_iterate_items(dil, &arg_devices) {
 		log_error("Failed to find physical volume \"%s\".", dev_name(dil->dev));
 		ret_max = ECMD_FAILED;
 	}
 
-	if (!process_all_devices)
-		goto out;
+	/*
+	 * pvs -a and pvdisplay -a want to show devices that are not PVs.
+	 */
+	if (process_other_devices) {
+		if (!_process_other_devices(cmd, handle, process_single_pv))
+			ret_max = ECMD_FAILED;
+	}
 
-	ret = _process_device_list(cmd, &all_devices, handle, process_single_pv);
-	if (ret != ECMD_PROCESSED)
-		stack;
-	if (ret > ret_max)
-		ret_max = ret;
 out:
 	log_restore_report_state(saved_log_report_state);
 	return ret_max;
@@ -5239,6 +5382,7 @@ int pvcreate_each_device(struct cmd_context *cmd,
 	struct pv_list *pvl;
 	struct pv_list *vgpvl;
 	struct device_list *devl;
+	char pvid[ID_LEN + 1] __attribute__((aligned(8))) = { 0 };
 	const char *pv_name;
 	unsigned int physical_block_size, logical_block_size;
 	unsigned int prev_pbs = 0, prev_lbs = 0;
@@ -5295,7 +5439,7 @@ int pvcreate_each_device(struct cmd_context *cmd,
 		struct device *dev;
 
 		/* No filter used here */
-		if (!(dev = dev_cache_get(cmd, pd->name, NULL))) {
+		if (!(dev = dev_cache_get_existing(cmd, pd->name, NULL))) {
 			log_error("No device found for %s.", pd->name);
 			dm_list_del(&pd->list);
 			dm_list_add(&pp->arg_fail, &pd->list);
@@ -5329,7 +5473,7 @@ int pvcreate_each_device(struct cmd_context *cmd,
 
 	cmd->use_full_md_check = 1;
 
-	if (cmd->enable_devices_file)
+	if (cmd->enable_devices_file && !pp->is_remove)
 		cmd->filter_deviceid_skip = 1;
 
 	log_debug("Scanning and filtering device args (%u).", dm_list_size(&scan_devs));
@@ -5411,7 +5555,7 @@ int pvcreate_each_device(struct cmd_context *cmd,
 	 */
 	if (!pp->is_remove && pp->uuid_str) {
 		struct device *dev;
-		if ((dev = lvmcache_device_from_pvid(cmd, &pp->pva.id, NULL))) {
+		if ((dev = lvmcache_device_from_pv_id(cmd, &pp->pva.id, NULL))) {
 			dm_list_iterate_items_safe(pd, pd2, &pp->arg_devices) {
 				if (pd->dev != dev) {
 					log_error("UUID %s already in use on \"%s\".", pp->uuid_str, dev_name(dev));
@@ -5555,7 +5699,7 @@ do_command:
 	dm_list_iterate_items(devl, &rescan_devs)
 		cmd->filter->wipe(cmd, cmd->filter, devl->dev, NULL);
 
-	if (cmd->enable_devices_file)
+	if (cmd->enable_devices_file && !pp->is_remove)
 		cmd->filter_deviceid_skip = 1;
 
 	log_debug("Rescanning and filtering device args with exclusive open");
@@ -5669,7 +5813,8 @@ do_command:
 				dm_list_add(&pp->pvs, &pvl->list);
 
 				/* allow deviceidtype_ARG/deviceid_ARG ? */
-				device_id_add(cmd, pd->dev, (const char *)&pvl->pv->id.uuid, NULL, NULL);
+				memcpy(pvid, &pvl->pv->id.uuid, ID_LEN);
+				device_id_add(cmd, pd->dev, pvid, NULL, NULL);
 
 			} else {
 				log_error("Failed to find PV %s", pd->name);
@@ -5708,7 +5853,8 @@ do_command:
 		}
 
 		/* allow deviceidtype_ARG/deviceid_ARG ? */
-		device_id_add(cmd, pd->dev, (const char *)&pv->id.uuid, NULL, NULL);
+		memcpy(pvid, &pv->id.uuid, ID_LEN);
+		device_id_add(cmd, pd->dev, pvid, NULL, NULL);
 
 		log_verbose("Set up physical volume for \"%s\" with %" PRIu64
 			    " available sectors.", pv_name, pv_size(pv));

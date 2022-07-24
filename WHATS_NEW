@@ -1,6 +1,60 @@
-Version 2.03.13 - 
+Version 2.03.17 - 
 ===============================
+
+Version 2.03.16 - 18th May 2022
+===============================
+  Fix segfault when handling selection with historical LVs.
+  Add support --vdosettings with lvcreate, lvconvert, lvchange.
+  Filtering multipath devices respects blacklist setting from multipath
+  configuration.
+  lvmdevices support for removing by device id using --deviceidtype and
+  --deldev.
+  Display writecache block size with lvs -o writecache_block_size.
+  Improve cachesettings description in man lvmcache.
+  Fix lossing of delete message on thin-pool extension.
+
+Version 2.03.15 - 07th February 2022
+====================================
+  Remove service based autoactivation. global/event_activation = 0 is NOOP.
+  Improve support for metadata profiles for --type writecache.
+  Use cache or active DM device when available with new kernels.
+  Introduce function to utilize UUIDs from DM_DEVICE_LIST.
+  Increase some hash table size to better support large device sets.
+
+Version 2.03.14 - 20th October 2021
+===================================
+  Device scanning is skipping directories on different filesystems.
+  Print info message with too many or too large archived files.
+  Reduce metadata readings during scanning phase.
+  Optimize computation of crc32 check sum with multiple PVs.
+  Enhance recover path on cache creation failure.
+  Filter out unsupported MQ/SMQ cache policy setting.
+  Fix memleak in mpath filter.
+  Support newer location for VDO statistics.
+  Add support for VDO async-unsafe write policy.
+  Improve lvm_import_vdo script.
+  Support VDO LV with lvcreate -ky.
+  Fix lvconvert for VDO LV bigger then 2T.
+  Create VDO LVs automatically without zeroing.
+  Rename vdoimport to lvm_import_vdo.
+
+Version 2.03.13 - 11th August 2021
+==================================
+  Changes in udev support:
+  - obtain_device_list_from_udev defaults to 0.
+  - see devices/external_device_info_source,
+    devices/obtain_device_list_from_udev, and devices/multipath_wwids_file help
+    in lvm.conf
+  Fix devices file handling of loop with deleted backing file.
+  Fix devices file handling of scsi_debug WWIDs.
+  Fix many static analysis issues.
+  Support --poolmetadataspare with vgsplit and vgmerge.
+  Fix detection of active components of external origin volume.
+  Add vdoimport tool to support conversion of VDO volumes.
+  Support configurable allocation/vdo_pool_header_size.
+  Fix handling of lvconvert --type vdo-pool --virtualsize.
   Simplified handling of archive() and backup() internal calls.
+  Add 'idm' locking type for IDM lock manager.
   Fix load of kvdo target when it is not present in memory (2.03.12).
 
 Version 2.03.12 - 07th May 2021

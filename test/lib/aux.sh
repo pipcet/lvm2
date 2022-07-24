@@ -607,7 +607,7 @@ teardown() {
 
 	# Remove any dangling symlink in /dev/disk (our tests can confuse udev)
 	test -d /dev/disk && {
-		find /dev/disk -type l ! -exec /usr/bin/test -e {} \; -print | xargs rm -f || true
+		find /dev/disk -type l ! -exec /usr/bin/test -e {} \; -print0 | xargs -0 rm -f || true
 	}
 
 	# Remove any metadata archives and backups from this test on system
@@ -1023,8 +1023,9 @@ prepare_devs() {
 	if test -n "$LVM_TEST_DEVICES_FILE"; then
 		mkdir -p "$TESTDIR/etc/lvm/devices" || true
 		rm "$TESTDIR/etc/lvm/devices/system.devices" || true
+		touch "$TESTDIR/etc/lvm/devices/system.devices"
 		for d in "${DEVICES[@]}"; do
-			lvmdevices --adddev "$dev" || true
+			lvmdevices --adddev "$d" || true
 		done
 	fi
 
@@ -1199,7 +1200,7 @@ remove_dm_devs() {
 		}
 		remove=( "${held[@]}" )
 	done
-	die "Can't remove device(s) ${held[@]}"
+	die "Can't remove device(s) ${held[*]}"
 }
 
 # Throttle down performance of kcopyd when mirroring i.e. disk image
@@ -1342,8 +1343,18 @@ prepare_vg() {
 	vgcreate $SHARED -s 512K "$vg" "${DEVICES[@]}"
 }
 
+extend_devices() {
+	test -z "$LVM_TEST_DEVICES_FILE" && return
+
+	for dev in "$@"; do
+		lvmdevices --adddev $dev
+	done
+}
+
 extend_filter() {
 	local filter
+
+	test -n "$LVM_TEST_DEVICES_FILE" && return
 
 	filter=$(grep ^devices/global_filter CONFIG_VALUES | tail -n 1)
 	for rx in "$@"; do
@@ -1354,6 +1365,8 @@ extend_filter() {
 
 extend_filter_md() {
 	local filter
+
+	test -n "$LVM_TEST_DEVICES_FILE" && return
 
 	filter=$(grep ^devices/global_filter CONFIG_VALUES | tail -n 1)
 	for rx in "$@"; do
@@ -1370,21 +1383,33 @@ extend_filter_LVMTEST() {
 hide_dev() {
 	local filter
 
-	filter=$(grep ^devices/global_filter CONFIG_VALUES | tail -n 1)
-	for dev in "$@"; do
-		filter=$(echo "$filter" | sed -e "s:\\[:[ \"r|$dev|\", :")
-	done
-	lvmconf "$filter"
+	if test -n "$LVM_TEST_DEVICES_FILE"; then
+		for dev in "$@"; do
+			lvmdevices --deldev $dev
+		done
+	else
+		filter=$(grep ^devices/global_filter CONFIG_VALUES | tail -n 1)
+		for dev in "$@"; do
+			filter=$(echo "$filter" | sed -e "s:\\[:[ \"r|$dev|\", :")
+		done
+		lvmconf "$filter"
+	fi
 }
 
 unhide_dev() {
 	local filter
 
-	filter=$(grep ^devices/global_filter CONFIG_VALUES | tail -n 1)
-	for dev in "$@"; do
-		filter=$(echo "$filter" | sed -e "s:\"r|$dev|\", ::")
-	done
-	lvmconf "$filter"
+	if test -n "$LVM_TEST_DEVICES_FILE"; then
+		for dev in "$@"; do
+			lvmdevices -y --adddev $dev
+		done
+	else
+		filter=$(grep ^devices/global_filter CONFIG_VALUES | tail -n 1)
+		for dev in "$@"; do
+			filter=$(echo "$filter" | sed -e "s:\"r|$dev|\", ::")
+		done
+		lvmconf "$filter"
+	fi
 }
 
 mkdev_md5sum() {
@@ -1433,13 +1458,13 @@ backup/backup = 0
 devices/cache_dir = "$TESTDIR/etc"
 devices/default_data_alignment = 1
 devices/dir = "$DM_DEV_DIR"
-devices/filter = "a|.*|"
-devices/global_filter = [ "a|$DM_DEV_DIR/mapper/${PREFIX}.*pv[0-9_]*$|", "r|.*|" ]
 devices/md_component_detection = 0
 devices/scan = "$DM_DEV_DIR"
 devices/sysfs_scan = 1
 devices/write_cache_state = 0
 devices/use_devicesfile = $LVM_TEST_DEVICES_FILE
+devices/filter = "a|.*|"
+devices/global_filter = [ "a|$DM_DEV_DIR/mapper/${PREFIX}.*pv[0-9_]*$|", "r|.*|" ]
 global/abort_on_internal_errors = 1
 global/cache_check_executable = "$LVM_TEST_CACHE_CHECK_CMD"
 global/cache_dump_executable = "$LVM_TEST_CACHE_DUMP_CMD"

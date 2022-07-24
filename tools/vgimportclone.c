@@ -61,14 +61,14 @@ static int _update_vg(struct cmd_context *cmd, struct volume_group *vg,
 	/*
 	 * N.B. lvs_in_vg_activated() is not smart enough to distinguish
 	 * between LVs that are active in the original VG vs the cloned VG
-	 * that's being imported, so check DEV_USED_FOR_LV.
+	 * that's being imported, so check dev_is_used_by_active_lv.
 	 */
 	dm_list_iterate_items(pvl, &vg->pvs) {
 		if (is_missing_pv(pvl->pv) || !pvl->pv->dev) {
 			log_error("VG is missing a device.");
 			goto bad;
 		}
-		if (pvl->pv->dev->flags & DEV_USED_FOR_LV) {
+		if (dev_is_used_by_active_lv(cmd, pvl->pv->dev, NULL, NULL, NULL, NULL)) {
 			log_error("Device %s has active LVs, deactivate first.", dev_name(pvl->pv->dev));
 			devs_used_for_lv++;
 		}
@@ -160,7 +160,7 @@ static int _update_vg(struct cmd_context *cmd, struct volume_group *vg,
 	 * will be included in the metadata.  The device file is written
 	 * (with these additions) at the end of the command.
 	 */
-	if (vp->import_devices) {
+	if (vp->import_devices || cmd->enable_devices_file) {
 		dm_list_iterate_items(devl, &vp->new_devs) {
 			if (!device_id_add(cmd, devl->dev, devl->dev->pvid, NULL, NULL)) {
 				log_error("Failed to add device id for %s.", dev_name(devl->dev));
@@ -194,7 +194,7 @@ static int _get_other_devs(struct cmd_context *cmd, struct dm_list *new_devs, st
 	while ((dev = dev_iter_get(cmd, iter))) {
 		if (_get_device_list(new_devs, dev))
 			continue;
-		if (!(devl = malloc(sizeof(*devl)))) {
+		if (!(devl = zalloc(sizeof(*devl)))) {
 			r = 0;
 			goto_bad;
 		}
@@ -278,7 +278,7 @@ int vgimportclone(struct cmd_context *cmd, int argc, char **argv)
 			goto out;
 		}
 
-		if (!(devl = malloc(sizeof(*devl))))
+		if (!(devl = zalloc(sizeof(*devl))))
 			goto_out;
 
 		devl->dev = dev;
@@ -311,8 +311,8 @@ int vgimportclone(struct cmd_context *cmd, int argc, char **argv)
 	 */
 	dm_list_iterate_items(devl, &vp.new_devs) {
 		if (!cmd->filter->passes_filter(cmd, cmd->filter, devl->dev, "persistent")) {
-			/* FIXME: print which filter */
-			log_error("Device %s was excluded by filters.", dev_name(devl->dev));
+			log_error("Device %s is excluded: %s.",
+				  dev_name(devl->dev), dev_filtered_reason(devl->dev));
 			goto out;
 		}
 	}
@@ -506,7 +506,7 @@ retry_name:
 	 * Should we be using device_ids_validate to check/fix other
 	 * devs in the devices file?
 	 */
-	if (vp.import_devices) {
+	if (vp.import_devices || cmd->enable_devices_file) {
 		if (!device_ids_write(cmd)) {
 			log_error("Failed to write devices file.");
 			goto out;

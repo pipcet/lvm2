@@ -59,8 +59,14 @@ void init_abort_on_internal_errors(int fatal);
 void fin_log(void);
 void reset_log_duplicated(void);
 
-void init_syslog(int facility);
+void init_syslog(int enable, int facility);
 void fin_syslog(void);
+
+void init_log_journal(uint32_t fields);
+uint32_t log_journal_str_to_val(const char *str);
+
+void log_command(const char *cmd_line, const char *cmd_name, const char *cmd_id);
+
 
 int error_message_produced(void);
 void reset_lvm_errno(int store_errmsg);

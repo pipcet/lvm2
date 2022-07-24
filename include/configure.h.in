@@ -1,5 +1,8 @@
 /* include/configure.h.in.  Generated from configure.ac by autoheader.  */
 
+/* Define to 1 to include code that uses libsystemd machine-id apis. */
+#undef APP_MACHINEID_SUPPORT
+
 /* Define to 1 to use libblkid detection of signatures when wiping. */
 #undef BLKID_WIPING_SUPPORT
 
@@ -87,6 +90,9 @@
 /* Use blkid wiping by default. */
 #undef DEFAULT_USE_BLKID_WIPING
 
+/* Default for lvm.conf use_devicefile. */
+#undef DEFAULT_USE_DEVICES_FILE
+
 /* Use lvmlockd by default. */
 #undef DEFAULT_USE_LVMLOCKD
 
@@ -107,9 +113,6 @@
 
 /* Define to 1 to enable the device-mapper filemap daemon. */
 #undef DMFILEMAPD
-
-/* Define to enable compat protocol */
-#undef DM_COMPAT
 
 /* Define default group for device node */
 #undef DM_DEVICE_GID
@@ -193,6 +196,9 @@
 
 /* Define to 1 if you have the <fcntl.h> header file. */
 #undef HAVE_FCNTL_H
+
+/* Define to 1 if you have the `ffs' function. */
+#undef HAVE_FFS
 
 /* Define to 1 if you have the <float.h> header file. */
 #undef HAVE_FLOAT_H
@@ -519,6 +525,9 @@
 /* valgrind.h found */
 #undef HAVE_VALGRIND
 
+/* Define to 1 if you have the `versionsort' function. */
+#undef HAVE_VERSIONSORT
+
 /* Define to 1 if you have the `vfork' function. */
 #undef HAVE_VFORK
 
@@ -543,6 +552,9 @@
 /* Define to 1 if the system has the `__builtin_clzll' built-in function */
 #undef HAVE___BUILTIN_CLZLL
 
+/* Define to 1 if the system has the `__builtin_ffs' built-in function */
+#undef HAVE___BUILTIN_FFS
+
 /* Define to 1 to include built-in support for integrity. */
 #undef INTEGRITY_INTERNAL
 
@@ -558,11 +570,11 @@
 /* Define to 1 to include code that uses lvmlockd dlm option. */
 #undef LOCKDDLM_SUPPORT
 
-/* Define to 1 to include code that uses lvmlockd sanlock option. */
-#undef LOCKDSANLOCK_SUPPORT
-
 /* Define to 1 to include code that uses lvmlockd IDM option. */
 #undef LOCKDIDM_SUPPORT
+
+/* Define to 1 to include code that uses lvmlockd sanlock option. */
+#undef LOCKDSANLOCK_SUPPORT
 
 /* Define to 1 if `lstat' dereferences a symlink specified with a trailing
    slash. */
@@ -570,6 +582,9 @@
 
 /* Path to lvmconfig binary. */
 #undef LVMCONFIG_PATH
+
+/* Path to lvm_import_vdo script. */
+#undef LVMIMPORTVDO_PATH
 
 /* Path to lvmlockd pidfile. */
 #undef LVMLOCKD_PIDFILE
@@ -652,6 +667,9 @@
 
 /* Define to 1 if strerror_r returns char *. */
 #undef STRERROR_R_CHAR_P
+
+/* Define to 1 to include code that uses systemd journal. */
+#undef SYSTEMD_JOURNAL_SUPPORT
 
 /* Path to testsuite data */
 #undef TESTSUITE_DATA

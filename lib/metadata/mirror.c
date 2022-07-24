@@ -456,6 +456,7 @@ static int _merge_mirror_images(struct logical_volume *lv,
 		return 1;
 
 	img_lvs = alloca(sizeof(*img_lvs) * addition);
+	memset(img_lvs, 0, sizeof(*img_lvs) * addition);
 
 	dm_list_iterate_items(lvl, mimages)
 		img_lvs[i++] = lvl->lv;
@@ -654,6 +655,11 @@ static int _split_mirror_images(struct logical_volume *lv,
 		}
 		lvl->lv = sub_lv;
 		dm_list_add(&split_images, &lvl->list);
+	}
+
+	if (!new_lv) {
+		log_error(INTERNAL_ERROR "New LV not found.");
+		return 0;
 	}
 
 	new_lv->name = dm_pool_strdup(lv->vg->vgmem, split_name);
@@ -1225,14 +1231,23 @@ int remove_mirrors_from_segments(struct logical_volume *lv,
 const char *get_pvmove_pvname_from_lv_mirr(const struct logical_volume *lv_mirr)
 {
 	struct lv_segment *seg;
+	struct device *dev;
 
 	dm_list_iterate_items(seg, &lv_mirr->segments) {
 		if (!seg_is_mirrored(seg))
 			continue;
-		if (seg_type(seg, 0) == AREA_PV)
-			return dev_name(seg_dev(seg, 0));
-		if (seg_type(seg, 0) == AREA_LV)
-			return dev_name(seg_dev(first_seg(seg_lv(seg, 0)), 0));
+		if (seg_type(seg, 0) == AREA_PV) {
+			dev = seg_dev(seg, 0);
+			if (!dev || dm_list_empty(&dev->aliases))
+				return NULL;
+			return dev_name(dev);
+		}
+		if (seg_type(seg, 0) == AREA_LV) {
+			dev = seg_dev(first_seg(seg_lv(seg, 0)), 0);
+			if (!dev || dm_list_empty(&dev->aliases))
+				return NULL;
+			return dev_name(dev);
+		}
 	}
 
 	return NULL;
@@ -1531,6 +1546,7 @@ static int _form_mirror(struct cmd_context *cmd, struct alloc_handle *ah,
 	 * create mirror image LVs
 	 */
 	img_lvs = alloca(sizeof(*img_lvs) * mirrors);
+	memset(img_lvs, 0, sizeof(*img_lvs) * mirrors);
 
 	if (!_create_mimage_lvs(ah, mirrors, stripes, stripe_size, lv, img_lvs, log))
 		return_0;

@@ -20,7 +20,7 @@
 #include "lib/device/dev-cache.h"
 #include "lib/device/dev-type.h"
 
-struct dev_filter *composite_filter_create(int n, int use_dev_ext_info, struct dev_filter **filters);
+struct dev_filter *composite_filter_create(int n, struct dev_filter **filters);
 
 struct dev_filter *lvm_type_filter_create(struct dev_types *dt);
 struct dev_filter *md_filter_create(struct cmd_context *cmd, struct dev_types *dt);
@@ -31,10 +31,6 @@ struct dev_filter *persistent_filter_create(struct dev_types *dt, struct dev_fil
 struct dev_filter *sysfs_filter_create(void);
 struct dev_filter *signature_filter_create(struct dev_types *dt);
 struct dev_filter *deviceid_filter_create(struct cmd_context *cmd);
-
-struct dev_filter *internal_filter_create(void);
-int internal_filter_allow(struct dm_pool *mem, struct device *dev);
-void internal_filter_clear(void);
 
 /*
  * patterns must be an array of strings of the form:

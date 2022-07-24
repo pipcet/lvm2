@@ -32,13 +32,15 @@
 #define DEV_NOT_O_NOATIME	0x00000400	/* Don't use O_NOATIME */
 #define DEV_IN_BCACHE		0x00000800      /* dev fd is open and used in bcache */
 #define DEV_BCACHE_EXCL		0x00001000      /* bcache_fd should be open EXCL */
-#define DEV_FILTER_AFTER_SCAN	0x00002000	/* apply filter after bcache has data */
-#define DEV_FILTER_OUT_SCAN	0x00004000	/* filtered out during label scan */
+/* unused                       0x00002000      */
+/* unused			0x00004000	*/
 #define DEV_BCACHE_WRITE	0x00008000      /* bcache_fd is open with RDWR */
 #define DEV_SCAN_FOUND_LABEL	0x00010000      /* label scan read dev and found label */
 #define DEV_IS_MD_COMPONENT	0x00020000	/* device is an md component */
 #define DEV_IS_NVME		0x00040000	/* set if dev is nvme */
 #define DEV_MATCHED_USE_ID	0x00080000	/* matched an entry from cmd->use_devices */
+#define DEV_SCAN_FOUND_NOLABEL	0x00100000	/* label_scan read, passed filters, but no lvm label */
+#define DEV_SCAN_NOT_READ	0x00200000	/* label_scan not able to read dev */
 
 /*
  * Support for external device info.
@@ -202,7 +204,7 @@ struct device *dev_create_file(const char *filename, struct device *dev,
 			       struct dm_str_list *alias, int use_malloc);
 void dev_destroy_file(struct device *dev);
 
-/* Return a valid device name from the alias list; NULL otherwise */
-const char *dev_name_confirmed(struct device *dev, int quiet);
+int dev_mpath_init(const char *config_wwids_file);
+void dev_mpath_exit(void);
 
 #endif

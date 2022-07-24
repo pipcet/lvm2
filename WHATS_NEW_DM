@@ -1,5 +1,22 @@
-Version 1.02.179 - 
+Version 1.02.187 - 
 ================================
+
+Version 1.02.185 - 18th May 2022
+================================
+
+Version 1.02.183 - 07th February 2022
+=====================================
+  Unmangle UUIDs for DM_DEVICE_LIST ioctl.
+
+Version 1.02.181 - 20th October 2021
+====================================
+  Add IMA support with 'dmsetup measure' command.
+  Add defines DM_NAME_LIST_FLAG_HAS_UUID, DM_NAME_LIST_FLAG_DOESNT_HAVE_UUID.
+  Enhance tracking of activated devices when preloading dm tree.
+  Fix bug in construction of cache table line (regression from 1.02.159).
+
+Version 1.02.179 - 11th August 2021
+===================================
 
 Version 1.02.177 - 07th May 2021
 ================================

@@ -42,7 +42,7 @@
 #define DEFAULT_DEV_DIR "/dev"
 #define DEFAULT_PROC_DIR "/proc"
 #define DEFAULT_SYSTEM_ID_SOURCE "none"
-#define DEFAULT_OBTAIN_DEVICE_LIST_FROM_UDEV 1
+#define DEFAULT_OBTAIN_DEVICE_LIST_FROM_UDEV 0
 #define DEFAULT_EXTERNAL_DEVICE_INFO_SOURCE "none"
 #define DEFAULT_SYSFS_SCAN 1
 #define DEFAULT_MD_COMPONENT_DETECTION 1
@@ -181,8 +181,7 @@
  * VDO pool will reverve some sectors in the front and the back of pool device to avoid
  * seeing same device twice in the system.
  */
-#define DEFAULT_VDO_POOL_HEADER_SIZE  (1024)   // 512KiB
-
+#define DEFAULT_VDO_POOL_HEADER_SIZE_KB  (512)
 
 
 #define DEFAULT_FSADM_PATH FSADM_PATH
@@ -222,7 +221,7 @@
 #endif
 
 #define DEFAULT_COMMAND_LOG_REPORT 0
-#define DEFAULT_SYSLOG 1
+#define DEFAULT_SYSLOG 0
 #define DEFAULT_VERBOSE 0
 #define DEFAULT_SILENT 0
 #define DEFAULT_LOGLEVEL 0
@@ -323,9 +322,14 @@
 
 #define DEFAULT_MD_COMPONENT_CHECKS "auto"
 
-#define DEFAULT_USE_DEVICES_FILE 0
 #define DEFAULT_DEVICES_FILE "system.devices"
 
 #define DEFAULT_SEARCH_FOR_DEVNAMES "auto"
+
+#define DEFAULT_WWIDS_FILE "/etc/multipath/wwids"
+
+#define PVS_ONLINE_DIR DEFAULT_RUN_DIR "/pvs_online"
+#define VGS_ONLINE_DIR DEFAULT_RUN_DIR "/vgs_online"
+#define PVS_LOOKUP_DIR DEFAULT_RUN_DIR "/pvs_lookup"
 
 #endif				/* _LVM_DEFAULTS_H */

@@ -26,6 +26,7 @@ static int _vgimportdevices_single(struct cmd_context *cmd,
 				   struct processing_handle *handle)
 {
 	struct vgimportdevices_params *vp = (struct vgimportdevices_params *) handle->custom_handle;
+	char pvid[ID_LEN + 1] __attribute__((aligned(8))) = { 0 };
 	struct pv_list *pvl;
 	struct physical_volume *pv;
 	int update_vg = 1;
@@ -34,8 +35,9 @@ static int _vgimportdevices_single(struct cmd_context *cmd,
 
 	dm_list_iterate_items(pvl, &vg->pvs) {
 		if (is_missing_pv(pvl->pv) || !pvl->pv->dev) {
-			log_error("Not importing devices for VG %s with missing PV %32s.",
-				 vg->name, (const char *)&pvl->pv->id.uuid);
+			memcpy(pvid, &pvl->pv->id.uuid, ID_LEN);
+			log_error("Not importing devices for VG %s with missing PV %s.",
+				 vg->name, pvid);
 			goto bad;
 		}
 	}
@@ -55,10 +57,10 @@ static int _vgimportdevices_single(struct cmd_context *cmd,
 	dm_list_iterate_items(pvl, &vg->pvs) {
 		pv = pvl->pv;
 
-		if (!idtypestr && pv->device_id_type)
-			idtypestr = pv->device_id_type;
+		idtypestr = pv->device_id_type;
 
-		device_id_add(cmd, pv->dev, (const char *)&pvl->pv->id.uuid, idtypestr, NULL);
+		memcpy(pvid, &pvl->pv->id.uuid, ID_LEN);
+		device_id_add(cmd, pv->dev, pvid, idtypestr, NULL);
 		vp->added_devices++;
 
 		/* We could skip update if the device_id has not changed. */
@@ -168,6 +170,17 @@ int vgimportdevices(struct cmd_context *cmd, int argc, char **argv)
 	cmd->filter_deviceid_skip = 1;
 	cmd->filter_regex_with_devices_file = 1;
 	cmd->create_edit_devices_file = 1;
+
+	/*
+	 * This helps a user bootstrap existing shared VGs into the devices
+	 * file. Reading the vg to import devices requires locking, but
+	 * lockstart won't find the vg before it's in the devices file.
+	 * So, allow importing devices without an lvmlockd lock (in a
+	 * a shared vg the vg metadata won't be updated with device ids,
+	 * so the lvmlockd lock isn't protecting vg modification.)
+	 */
+	cmd->lockd_gl_disable = 1;
+	cmd->lockd_vg_disable = 1;
 
 	/*
 	 * For each VG:

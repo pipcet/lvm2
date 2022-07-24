@@ -47,7 +47,7 @@ struct lvmcache_vginfo;
  */
 struct lvmcache_vgsummary {
 	const char *vgname;
-	struct id vgid;
+	char vgid[ID_LEN + 1];
 	uint64_t vgstatus;
 	char *creation_host;
 	const char *system_id;
@@ -84,7 +84,6 @@ void lvmcache_del_dev(struct device *dev);
 int lvmcache_update_vgname_and_id(struct cmd_context *cmd, struct lvmcache_info *info,
 				  struct lvmcache_vgsummary *vgsummary);
 int lvmcache_update_vg_from_read(struct volume_group *vg, unsigned precommitted);
-int lvmcache_update_vg_from_write(struct volume_group *vg);
 
 void lvmcache_lock_vgname(const char *vgname, int read_only);
 void lvmcache_unlock_vgname(const char *vgname);
@@ -96,9 +95,10 @@ struct lvmcache_vginfo *lvmcache_vginfo_from_vgname(const char *vgname,
 					   const char *vgid);
 struct lvmcache_vginfo *lvmcache_vginfo_from_vgid(const char *vgid);
 struct lvmcache_info *lvmcache_info_from_pvid(const char *pvid, struct device *dev, int valid_only);
+struct lvmcache_info *lvmcache_info_from_pv_id(const struct id *pv_id, struct device *dev, int valid_only);
 const char *lvmcache_vgname_from_vgid(struct dm_pool *mem, const char *vgid);
 const char *lvmcache_vgid_from_vgname(struct cmd_context *cmd, const char *vgname);
-struct device *lvmcache_device_from_pvid(struct cmd_context *cmd, const struct id *pvid, uint64_t *label_sector);
+struct device *lvmcache_device_from_pv_id(struct cmd_context *cmd, const struct id *pv_id, uint64_t *label_sector);
 const char *lvmcache_vgname_from_info(struct lvmcache_info *info);
 const struct format_type *lvmcache_fmt_from_info(struct lvmcache_info *info);
 
@@ -181,7 +181,7 @@ int lvmcache_vg_is_foreign(struct cmd_context *cmd, const char *vgname, const ch
 
 bool lvmcache_scan_mismatch(struct cmd_context *cmd, const char *vgname, const char *vgid);
 
-int lvmcache_vginfo_has_pvid(struct lvmcache_vginfo *vginfo, char *pvid);
+int lvmcache_vginfo_has_pvid(struct lvmcache_vginfo *vginfo, const char *pvid_arg);
 
 uint64_t lvmcache_max_metadata_size(void);
 void lvmcache_save_metadata_size(uint64_t val);
@@ -209,6 +209,8 @@ void lvmcache_del_outdated_devs(struct cmd_context *cmd,
 
 void lvmcache_save_bad_mda(struct lvmcache_info *info, struct metadata_area *mda);
 
+void lvmcache_del_save_bad_mda(struct lvmcache_info *info, int mda_num, int bad_mda_flag);
+
 void lvmcache_get_bad_mdas(struct cmd_context *cmd,
                            const char *vgname, const char *vgid,
                            struct dm_list *bad_mda_list);
@@ -225,5 +227,7 @@ struct metadata_area *lvmcache_get_dev_mda(struct device *dev, int mda_num);
 void lvmcache_extra_md_component_checks(struct cmd_context *cmd);
 
 unsigned int lvmcache_vg_info_count(void);
+
+int lvmcache_pvsummary_count(const char *vgname);
 
 #endif

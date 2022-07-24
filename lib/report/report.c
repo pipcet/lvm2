@@ -47,6 +47,7 @@ static uint32_t _log_seqnum = 1;
  */
 #define FIELD(type, strct, sorttype, head, field_name, width, func, id, desc, writeable) field_ ## id,
 enum {
+/* coverity[unnecessary_header] */
 #include "columns.h"
 };
 #undef FIELD
@@ -819,7 +820,7 @@ static void _adjust_time_for_granularity(struct time_info *info, struct tm *tm, 
 
 #define SECS_PER_MINUTE 60
 #define SECS_PER_HOUR   3600
-#define SECS_PER_DAY    86400
+#define SECS_PER_DAY    ((time_t)86400)
 
 static int _days_in_month[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
 
@@ -881,7 +882,6 @@ static int _translate_time_items(struct dm_report *rh, struct time_info *info,
 	long multiplier = 1;
 	struct tm tm_now;
 	time_id_t id;
-	char *end;
 	long num;
 	struct tm tm; /* absolute time */
 	time_t t = 0; /* offset into past before absolute time */
@@ -898,7 +898,7 @@ static int _translate_time_items(struct dm_report *rh, struct time_info *info,
 
 		if (_is_time_num(id)) {
 			errno = 0;
-			num = strtol(ti->s, &end, 10);
+			num = strtol(ti->s, NULL, 10);
 			if (errno) {
 				log_error("_translate_time_items: invalid time.");
 				return 0;
@@ -2342,7 +2342,7 @@ static int _lv_size_disp(struct dm_report *rh, struct dm_pool *mem,
 	uint64_t size = lv->le_count;
 
 	if (seg && !lv_is_raid_image(lv))
-		size -= seg->reshape_len * (seg->area_count > 2 ? (seg->area_count - seg->segtype->parity_devs) : 1);
+		size -= (uint64_t) seg->reshape_len * (seg->area_count > 2 ? (seg->area_count - seg->segtype->parity_devs) : 1);
 
 	size *= lv->vg->extent_size;
 
@@ -3346,6 +3346,26 @@ static int _integritymismatches_disp(struct dm_report *rh __attribute__((unused)
 	return _field_set_value(field, "", &GET_TYPE_RESERVED_VALUE(num_undef_64));
 }
 
+static int _writecache_block_size_disp(struct dm_report *rh __attribute__((unused)),
+				   struct dm_pool *mem,
+				   struct dm_report_field *field,
+				   const void *data,
+				   void *private __attribute__((unused)))
+{
+	struct logical_volume *lv = (struct logical_volume *) data;
+	uint32_t bs = 0;
+
+	if (lv_is_writecache(lv)) {
+		struct lv_segment *seg = first_seg(lv);
+		bs = seg->writecache_block_size;
+	}
+
+	if (!bs)
+		return dm_report_field_int32(rh, field, &GET_TYPE_RESERVED_VALUE(num_undef_32));
+
+	return dm_report_field_uint32(rh, field, &bs);
+}
+
 static int _datapercent_disp(struct dm_report *rh, struct dm_pool *mem,
 			     struct dm_report_field *field,
 			     const void *data, void *private)
@@ -4340,6 +4360,7 @@ typedef struct label type_label;
 typedef dev_known_type_t type_devtype;
 
 static const struct dm_report_field_type _fields[] = {
+/* coverity[unnecessary_header] */
 #include "columns.h"
 {0, 0, 0, 0, "", "", NULL, NULL},
 };
@@ -4350,6 +4371,7 @@ static const struct dm_report_field_type _devtypes_fields[] = {
 };
 
 static const struct dm_report_field_type _log_fields[] = {
+/* coverity[unnecessary_header] */
 #include "columns-cmdlog.h"
 {0, 0, 0, 0, "", "", NULL, NULL},
 };

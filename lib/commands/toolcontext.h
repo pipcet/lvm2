@@ -29,7 +29,9 @@ struct config_info {
 	int debug_classes;
 	int verbose;
 	int silent;
+	int suppress;
 	int test;
+	int yes;
 	int syslog;
 	int activation;
 	int suffix;
@@ -40,6 +42,7 @@ struct config_info {
 	int udev_sync;
 	int udev_fallback;
 	int issue_discards;
+	uint32_t journal;
 	const char *msg_prefix;
 	const char *fmt_name;
 	const char *dmeventd_executable;
@@ -171,7 +174,7 @@ struct cmd_context {
 	unsigned activate_component:1;		/* command activates component LV */
 	unsigned process_component_lvs:1;	/* command processes also component LVs */
 	unsigned mirror_warn_printed:1;		/* command already printed warning about non-monitored mirrors */
-	unsigned pvscan_cache_single:1;
+	unsigned expect_missing_vg_device:1;	/* when reading a vg it's expected that a dev for a pv isn't found */
 	unsigned can_use_one_scan:1;
 	unsigned is_clvmd:1;
 	unsigned md_component_detection:1;
@@ -192,17 +195,27 @@ struct cmd_context {
 	unsigned filter_nodata_only:1;          /* only use filters that do not require data from the dev */
 	unsigned run_by_dmeventd:1;		/* command is being run by dmeventd */
 	unsigned sysinit:1;			/* --sysinit is used */
+	unsigned ignorelockingfailure:1;	/* --ignorelockingfailure is used */
+	unsigned check_devs_used:1;		/* check devs used by LVs */
+	unsigned print_device_id_not_found:1;	/* print devices file entries not found */
+	unsigned ignore_device_name_mismatch:1; /* skip updating devices file names */
+	unsigned backup_disabled:1;		/* skip repeated debug message */
+	unsigned event_activation:1;		/* whether event_activation is set */
+	unsigned udevoutput:1;
+	unsigned online_vg_file_removed:1;
+	unsigned disable_dm_devs:1;		/* temporarily disable use of dm devs cache */
 
 	/*
 	 * Devices and filtering.
 	 */
 	struct dev_filter *filter;
-	struct dm_list hints;
 	struct dm_list use_devices;		/* struct dev_use for each entry in devices file */
 	const char *md_component_checks;
 	const char *search_for_devnames;	/* config file setting */
 	const char *devicesfile;                /* from --devicesfile option */
 	struct dm_list deviceslist;             /* from --devices option, struct dm_str_list */
+
+	struct dm_list *cache_dm_devs;		/* cache with UUIDs from DM_DEVICE_LIST (when available) */
 
 	/*
 	 * Configuration.

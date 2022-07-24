@@ -146,10 +146,12 @@
 #include "lib/label/hints.h"
 #include "lib/device/dev-type.h"
 #include "lib/device/device_id.h"
+#include "lib/device/online.h"
 
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <time.h>
 #include <sys/types.h>
 #include <sys/file.h>
@@ -234,6 +236,7 @@ static int _touch_newhints(void)
 		return_0;
 	if (fclose(fp))
 		stack;
+	log_debug("newhints created");
 	return 1;
 }
 
@@ -365,7 +368,6 @@ static void _unlock_hints(struct cmd_context *cmd)
 
 void hints_exit(struct cmd_context *cmd)
 {
-	free_hints(&cmd->hints);
 	if (_hints_fd == -1)
 		return;
 	_unlock_hints(cmd);
@@ -498,12 +500,27 @@ int validate_hints(struct cmd_context *cmd, struct dm_list *hints)
 	if (!(iter = dev_iter_create(NULL, 0)))
 		return 0;
 	while ((dev = dev_iter_get(cmd, iter))) {
+		if (dm_list_empty(&dev->aliases))
+			continue;
 		if (!(hint = _find_hint_name(hints, dev_name(dev))))
 			continue;
 
 		/* The cmd hasn't needed this hint's dev so it's not been scanned. */
 		if (!hint->chosen)
 			continue;
+
+		/* 
+		 * label_scan was unable to read the dev so we don't know its pvid.
+		 * Since we are unable to verify the hint is correct, it's possible
+		 * that the PVID is actually found on a different device, so don't
+		 * depend on hints. (This would also fail the following pvid check.)
+		 */
+		if (dev->flags & DEV_SCAN_NOT_READ) {
+			log_debug("Uncertain hint for unread device %d:%d %s",
+				  major(hint->devt), minor(hint->devt), dev_name(dev));
+			ret = 0;
+			continue;
+		}
 
 		if (strcmp(dev->pvid, hint->pvid)) {
 			log_debug("Invalid hint device %d:%d %s pvid %s had hint pvid %s",
@@ -821,7 +838,7 @@ static int _read_hint_file(struct cmd_context *cmd, struct dm_list *hints, int *
 			if (!dm_strncpy(hint.vgname, vgname + 3, sizeof(hint.vgname)))
 				continue;
 
-		if (!(alloc_hint = malloc(sizeof(struct hint)))) {
+		if (!(alloc_hint = zalloc(sizeof(struct hint)))) {
 			ret = 0;
 			break;
 		}
@@ -1213,8 +1230,8 @@ void invalidate_hints(struct cmd_context *cmd)
  * probably want to exclude that command from attempting this optimization,
  * because it would be difficult to know what VG that command wanted to use.
  */
-static void _get_single_vgname_cmd_arg(struct cmd_context *cmd,
-				       struct dm_list *hints, char **vgname)
+void get_single_vgname_cmd_arg(struct cmd_context *cmd,
+			       struct dm_list *hints, char **vgname)
 {
 	struct hint *hint;
 	char namebuf[NAME_LEN];
@@ -1263,6 +1280,11 @@ static void _get_single_vgname_cmd_arg(struct cmd_context *cmd,
 		return;
 
 check:
+	if (!hints) {
+		*vgname = name;
+		return;
+	}
+
 	/*
 	 * Only use this vgname hint if there are hints that contain this
 	 * vgname.  This might happen if we aren't able to properly extract the
@@ -1391,6 +1413,16 @@ int get_hints(struct cmd_context *cmd, struct dm_list *hints_out, int *newhints,
 		log_debug("get_hints: needs refresh");
 		free_hints(&hints_list);
 
+		/*
+		 * This is not related to hints, and is probably unnecessary,
+		 * but it could possibly help.  When hints become invalid it's
+		 * usually becaues devs on the system have changed, and that
+		 * also means that a missing devices file entry might be found
+		 * by searching devices again.  (the searched_devnames
+		 * mechanism should eventually be replaced)
+		 */
+		unlink_searched_devnames(cmd);
+
 		if (!_lock_hints(cmd, LOCK_EX, NONBLOCK))
 			return 0;
 
@@ -1424,7 +1456,7 @@ int get_hints(struct cmd_context *cmd, struct dm_list *hints_out, int *newhints,
 	 * us which devs are PVs. We might want to enable this optimization
 	 * separately.)
 	 */
-	_get_single_vgname_cmd_arg(cmd, &hints_list, &vgname);
+	get_single_vgname_cmd_arg(cmd, &hints_list, &vgname);
 
 	_apply_hints(cmd, &hints_list, vgname, devs_in, devs_out);
 

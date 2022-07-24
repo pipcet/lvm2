@@ -139,6 +139,10 @@ struct arg_value_group_list {
 #define ALLOW_HINTS		 0x00004000
 /* Command can access exported vg. */
 #define ALLOW_EXPORTED           0x00008000
+/* Command checks and reports warning if devs used by LV are incorrect. */
+#define CHECK_DEVS_USED		 0x00010000
+/* Command prints devices file entries that were not found. */
+#define DEVICE_ID_NOT_FOUND      0x00020000
 
 
 void usage(const char *name);
@@ -224,7 +228,7 @@ int mirror_remove_missing(struct cmd_context *cmd,
 
 
 int vgchange_activate(struct cmd_context *cmd, struct volume_group *vg,
-		       activation_change_t activate);
+		       activation_change_t activate, int vg_complete_to_activate);
 
 int vgchange_background_polling(struct cmd_context *cmd, struct volume_group *vg);
 

@@ -18,9 +18,9 @@
 #include <fcntl.h>
 
 struct lvcreate_cmdline_params {
-	percent_type_t percent;
 	uint64_t size;
 	uint64_t virtual_size; /* snapshot, thin */
+	percent_type_t percent;
 	char **pvs;
 	uint32_t pv_count;
 };
@@ -698,6 +698,23 @@ static int _read_cache_params(struct cmd_context *cmd,
 	return 1;
 }
 
+static int _read_vdo_params(struct cmd_context *cmd,
+			    struct lvcreate_params *lp)
+{
+	if (!seg_is_vdo(lp))
+		return 1;
+
+	// prefiling settings here
+	if (!fill_vdo_target_params(cmd, &lp->vdo_params,  &lp->vdo_pool_header_size, NULL))
+		return_0;
+
+	// override with optional vdo settings
+	if (!get_vdo_settings(cmd, &lp->vdo_params, NULL))
+		return_0;
+
+	return 1;
+}
+
 static int _read_activation_params(struct cmd_context *cmd,
 				   struct volume_group *vg,
 				   struct lvcreate_params *lp)
@@ -823,13 +840,18 @@ static int _lvcreate_params(struct cmd_context *cmd,
 	alloc_ARG,\
 	autobackup_ARG,\
 	available_ARG,\
+	cachesettings_ARG,\
 	contiguous_ARG,\
+	devices_ARG,\
+	devicesfile_ARG,\
 	ignoreactivationskip_ARG,\
 	ignoremonitoring_ARG,\
+	journal_ARG,\
 	metadataprofile_ARG,\
 	monitor_ARG,\
 	mirrors_ARG,\
 	name_ARG,\
+	nohints_ARG,\
 	noudevsync_ARG,\
 	permission_ARG,\
 	persistent_ARG,\
@@ -842,8 +864,7 @@ static int _lvcreate_params(struct cmd_context *cmd,
 	cachemetadataformat_ARG,\
 	cachemode_ARG,\
 	cachepool_ARG,\
-	cachepolicy_ARG,\
-	cachesettings_ARG
+	cachepolicy_ARG
 
 #define MIRROR_ARGS \
 	corelog_ARG,\
@@ -884,7 +905,8 @@ static int _lvcreate_params(struct cmd_context *cmd,
 #define VDO_POOL_ARGS \
 	vdopool_ARG,\
 	compression_ARG,\
-	deduplication_ARG
+	deduplication_ARG,\
+	vdosettings_ARG
 
 	/* Cache and cache-pool segment type */
 	if (seg_is_cache(lp)) {
@@ -1094,19 +1116,6 @@ static int _lvcreate_params(struct cmd_context *cmd,
 						zero_ARG,
 						-1))
 			return_0;
-
-		// FIXME: prefiling here - this is wrong place
-		// but will work for this moment
-		if (!fill_vdo_target_params(cmd, &lp->vdo_params, NULL))
-			return_0;
-
-		if (arg_is_set(cmd, compression_ARG))
-			lp->vdo_params.use_compression =
-				arg_int_value(cmd, compression_ARG, 0);
-
-		if (arg_is_set(cmd, deduplication_ARG))
-			lp->vdo_params.use_deduplication =
-				arg_int_value(cmd, deduplication_ARG, 0);
 	}
 
 	/* Check options shared between more segment types */
@@ -1194,6 +1203,7 @@ static int _lvcreate_params(struct cmd_context *cmd,
 			      &lp->pool_metadata_size, &lp->pool_metadata_spare,
 			      &lp->chunk_size, &lp->discards, &lp->zero_new_blocks)) ||
 	    !_read_cache_params(cmd, lp) ||
+	    !_read_vdo_params(cmd, lp) ||
 	    !_read_mirror_and_raid_params(cmd, lp))
 		return_0;
 
@@ -1687,6 +1697,7 @@ static int _lvcreate_single(struct cmd_context *cmd, const char *vg_name,
 	struct lvcreate_params *lp = pp->lp;
 	struct lvcreate_cmdline_params *lcp = pp->lcp;
 	struct logical_volume *spare = vg->pool_metadata_spare_lv;
+	struct logical_volume *lv;
 	int ret = ECMD_FAILED;
 
 	if (!_read_activation_params(cmd, vg, lp))
@@ -1755,8 +1766,11 @@ static int _lvcreate_single(struct cmd_context *cmd, const char *vg_name,
 		lp->needs_lockd_init = 1;
 	}
 
-	if (!lv_create_single(vg, lp))
+	if (!(lv = lv_create_single(vg, lp)))
 		goto_out;
+
+	if (!lp->lv_name)
+		lp->lv_name = lv->name; /* Get created LV name when it was not specified */
 
 	ret = ECMD_PROCESSED;
 out:
@@ -1843,29 +1857,27 @@ static int _lvcreate_and_attach_writecache_single(struct cmd_context *cmd,
 int lvcreate_and_attach_writecache_cmd(struct cmd_context *cmd, int argc, char **argv)
 {
 	struct processing_handle *handle = NULL;
-	struct processing_params pp;
 	struct lvcreate_params lp = {
 		.major = -1,
 		.minor = -1,
+		/*
+		 * Tell lvcreate to ignore --type since we are using lvcreate
+		 * to create a linear LV and using lvconvert to add cache.
+		 * (Would be better if lvcreate code was split up so we could
+		 * call a specific function that just created a linear/striped LV.)
+		 */
+		.ignore_type = 1,
 	};
 	struct lvcreate_cmdline_params lcp = { 0 };
+	struct processing_params pp = {
+	    .lp = &lp,
+	    .lcp = &lcp,
+	};
 	int ret;
-
-	/*
-	 * Tell lvcreate to ignore --type since we are using lvcreate
-	 * to create a linear LV and using lvconvert to add cache.
-	 * (Would be better if lvcreate code was split up so we could
-	 * call a specific function that just created a linear/striped LV.)
-	 */
-	lp.ignore_type = 1;
-
 	if (!_lvcreate_params(cmd, argc, argv, &lp, &lcp)) {
 		stack;
 		return EINVALID_CMD_LINE;
 	}
-
-	pp.lp = &lp;
-	pp.lcp = &lcp;
 
         if (!(handle = init_processing_handle(cmd, NULL))) {
 		log_error("Failed to initialize processing handle.");
@@ -1917,29 +1929,28 @@ static int _lvcreate_and_attach_cache_single(struct cmd_context *cmd,
 int lvcreate_and_attach_cache_cmd(struct cmd_context *cmd, int argc, char **argv)
 {
 	struct processing_handle *handle = NULL;
-	struct processing_params pp;
 	struct lvcreate_params lp = {
 		.major = -1,
 		.minor = -1,
+		/*
+		 * Tell lvcreate to ignore --type since we are using lvcreate
+		 * to create a linear LV and using lvconvert to add cache.
+		 * (Would be better if lvcreate code was split up so we could
+		 * call a specific function that just created a linear/striped LV.)
+		 */
+		.ignore_type = 1,
 	};
 	struct lvcreate_cmdline_params lcp = { 0 };
+	struct processing_params pp = {
+	    .lp = &lp,
+	    .lcp = &lcp,
+	};
 	int ret;
-
-	/*
-	 * Tell lvcreate to ignore --type since we are using lvcreate
-	 * to create a linear LV and using lvconvert to add cache.
-	 * (Would be better if lvcreate code was split up so we could
-	 * call a specific function that just created a linear/striped LV.)
-	 */
-	lp.ignore_type = 1;
 
 	if (!_lvcreate_params(cmd, argc, argv, &lp, &lcp)) {
 		stack;
 		return EINVALID_CMD_LINE;
 	}
-
-	pp.lp = &lp;
-	pp.lcp = &lcp;
 
 	if (!(handle = init_processing_handle(cmd, NULL))) {
 		log_error("Failed to initialize processing handle.");
@@ -1955,4 +1966,3 @@ int lvcreate_and_attach_cache_cmd(struct cmd_context *cmd, int argc, char **argv
 	destroy_processing_handle(cmd, handle);
 	return ret;
 }
-

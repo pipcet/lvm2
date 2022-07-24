@@ -102,7 +102,7 @@ struct dir {
         if ( !d )
             throw syserr( "error opening directory", p );
     }
-    ~dir() { closedir( d ); }
+    ~dir() { (void) closedir( d ); }
 };
 
 typedef std::vector< std::string > Listing;
@@ -111,8 +111,8 @@ inline void fsync_name( std::string n )
 {
     int fd = open( n.c_str(), O_WRONLY );
     if ( fd >= 0 ) {
-        fsync( fd );
-        close( fd );
+        (void) fsync( fd );
+        (void) close( fd );
     }
 }
 
@@ -424,7 +424,8 @@ struct FdSink : Sink {
     {
         TimedBuffer::Line line = stream.shift( force );
         std::string out = fmt.format( line );
-        write( fd, out.c_str(), out.length() );
+        if ( write( fd, out.c_str(), out.length() ) < (int)out.length() )
+            perror( "short write" );
     }
 
     virtual void sync( bool force ) {
@@ -463,8 +464,8 @@ struct FileSink : FdSink {
 
     ~FileSink() {
         if ( fd >= 0 ) {
-            fsync( fd );
-            close( fd );
+            (void) fsync( fd );
+            (void) close( fd );
         }
     }
 };
@@ -481,6 +482,7 @@ struct Source {
 
     virtual void sync( Sink *sink ) {
         ssize_t sz;
+        /* coverity[stack_use_local_overflow] */
         char buf[ 128 * 1024 ];
         if ( (sz = read(fd, buf, sizeof(buf) - 1)) > 0 )
             sink->push( std::string( buf, sz ) );
@@ -514,7 +516,7 @@ struct Source {
     Source( int _fd = -1 ) : fd( _fd ) {}
     virtual ~Source() {
         if ( fd >= 0 )
-            ::close( fd );
+            (void) ::close( fd );
     }
 };
 
@@ -536,7 +538,11 @@ struct FileSource : Source {
                 lseek( fd, 0, SEEK_END );
         }
         if ( fd >= 0 )
-            Source::sync( s );
+            try {
+                Source::sync( s );
+            } catch (...) {
+                perror("failed to sync");
+            }
     }
 };
 
@@ -565,7 +571,7 @@ struct KMsg : Source {
                 can_clear = false;
         } else if ( lseek( fd, 0L, SEEK_END ) == (off_t) -1 ) {
             fprintf( stderr, "lseek log %s %s\n", read_msg, strerror( errno ) );
-            close(fd);
+            (void) close(fd);
             fd = -1;
         }
 #endif
@@ -707,13 +713,13 @@ struct TestProcess
         if ( !interactive ) {
             int devnull = ::open( "/dev/null", O_RDONLY );
             if ( devnull >= 0 ) { /* gcc really doesn't like to not have stdin */
-                dup2( devnull, STDIN_FILENO );
-                close( devnull );
+                (void) dup2( devnull, STDIN_FILENO );
+                (void) close( devnull );
             } else
-                close( STDIN_FILENO );
-            dup2( fd, STDOUT_FILENO );
-            dup2( fd, STDERR_FILENO );
-            close( fd );
+                (void) close( STDIN_FILENO );
+            (void) dup2( fd, STDOUT_FILENO );
+            (void) dup2( fd, STDERR_FILENO );
+            (void) close( fd );
         }
 
         setpgid( 0, 0 );
@@ -755,7 +761,7 @@ struct TestCase {
     }
 
     void pipe() {
-        int fds[2];
+        int fds[2] = { 0 };
 
         if (socketpair( PF_UNIX, SOCK_STREAM, 0, fds )) {
             perror("socketpair");
@@ -799,7 +805,7 @@ struct TestCase {
                 if ( waitpid( pid, &status, WNOHANG ) == 0 ) {
                     system( "echo t > /proc/sysrq-trigger 2> /dev/null" );
                     kill( -pid, SIGKILL );
-                    waitpid( pid, &status, 0 );
+                    (void) waitpid( pid, &status, 0 );
                 }
                 timeout = true;
                 io.sync( true );
@@ -892,7 +898,7 @@ struct TestCase {
 
     void parent()
     {
-        ::close( child.fd );
+        (void) ::close( child.fd );
         setupIO();
 
         journal->started( id() );
@@ -952,9 +958,9 @@ struct TestCase {
             exit(201);
         } else if (pid == 0) {
             io.close();
-            chdir( options.workdir.c_str() );
+            (void) chdir( options.workdir.c_str() );
             if ( !options.flavour_envvar.empty() )
-                setenv( options.flavour_envvar.c_str(), flavour.c_str(), 1 );
+                (void) setenv( options.flavour_envvar.c_str(), flavour.c_str(), 1 );
             child.exec();
         } else {
             parent();
@@ -981,7 +987,9 @@ struct TestCase {
     }
 
     TestCase( Journal &j, Options opt, std::string path, std::string _name, std::string _flavour )
-        : child( path ), name( _name ), flavour( _flavour ), timeout( false ),
+        : child( path ), name( _name ), flavour( _flavour ),
+          iobuf( NULL ), usage( (struct rusage) { { 0 } } ), status( 0 ), timeout( false ),
+          pid( 0 ), start( 0 ), end( 0 ), silent_start( 0 ),
           last_update( 0 ), last_heartbeat( 0 ), options( opt ), journal( &j )
     {
     }
@@ -1046,7 +1054,7 @@ struct Main {
         if ( options.cont )
             journal.read();
         else
-            ::unlink( journal.location.c_str() );
+            (void) ::unlink( journal.location.c_str() );
     }
 
     int run() {
@@ -1085,7 +1093,7 @@ struct Main {
         return journal.count( Journal::FAILED ) || journal.count( Journal::TIMEOUT ) ? 1 : 0;
     }
 
-    Main( Options o ) : die( false ), journal( o.outdir ), options( o ) {}
+    Main( Options o ) : die( false ), start( 0 ), journal( o.outdir ), options( o ) {}
 };
 
 namespace {

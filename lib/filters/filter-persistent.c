@@ -58,7 +58,7 @@ static int _init_hash(struct pfilter *pf)
 	if (pf->devices)
 		dm_hash_destroy(pf->devices);
 
-	if (!(pf->devices = dm_hash_create(111)))
+	if (!(pf->devices = dm_hash_create(511)))
 		return_0;
 
 	return 1;
@@ -109,8 +109,6 @@ static int _lookup_p(struct cmd_context *cmd, struct dev_filter *f, struct devic
 
 	/* Uncached, check filters and cache the result */
 	if (!l) {
-		dev->flags &= ~DEV_FILTER_AFTER_SCAN;
-
 		pass = pf->real->passes_filter(cmd, pf->real, dev, use_filter_name);
 
 		if (!pass) {
@@ -120,24 +118,17 @@ static int _lookup_p(struct cmd_context *cmd, struct dev_filter *f, struct devic
 			 * because the deferred result won't change the exclude.
 			 */
 			l = PF_BAD_DEVICE;
-
-		} else if ((pass == -EAGAIN) || (dev->flags & DEV_FILTER_AFTER_SCAN)) {
-			/*
-			 * When the filter result is deferred, we let the device
-			 * pass for now, but do not cache the result.  We need to
-			 * rerun the filters later.  At that point the final result
-			 * will be cached.
-			 */
-			log_debug_devs("filter cache deferred %s", dev_name(dev));
-			dev->flags |= DEV_FILTER_AFTER_SCAN;
-			pass = 1;
-			goto out;
-
-		} else if (pass) {
+		} else if (pass == 1) {
 			l = PF_GOOD_DEVICE;
+		} else {
+			log_error("Ignore invalid filter result %d %s", pass, dev_name(dev));
+			pass = 1;
+			/* don't cache invalid result */
+			goto out;
 		}
 
-		log_debug_devs("filter caching %s %s", pass ? "good" : "bad", dev_name(dev));
+		if (!dev->filtered_flags) /* skipping reason already logged by filter */
+			log_debug_devs("filter caching %s %s", pass ? "good" : "bad", dev_name(dev));
 
 		dm_list_iterate_items(sl, &dev->aliases)
 			if (!dm_hash_insert(pf->devices, sl->str, l)) {

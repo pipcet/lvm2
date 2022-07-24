@@ -107,6 +107,8 @@ static struct dm_task *_setup_task_run(int task, struct dm_info *info,
 				       int with_flush,
 				       int query_inactive)
 {
+	char vsn[80];
+	unsigned maj, min;
 	struct dm_task *dmt;
 
 	if (!(dmt = dm_task_create(task)))
@@ -138,8 +140,20 @@ static struct dm_task *_setup_task_run(int task, struct dm_info *info,
 	if (!with_flush && !dm_task_no_flush(dmt))
 		log_warn("WARNING: Failed to set no_flush.");
 
-	if (task == DM_DEVICE_TARGET_MSG)
+	switch (task) {
+	case DM_DEVICE_TARGET_MSG:
 		return dmt; /* TARGET_MSG needs more local tweaking before task_run() */
+	case DM_DEVICE_LIST:
+		/* Use 'newuuid' only with DM version that supports it */
+		if (driver_version(vsn, sizeof(vsn)) &&
+		    (sscanf(vsn, "%u.%u", &maj, &min) == 2) &&
+		    (maj == 4 ? min >= 19 : maj > 4) &&
+		    !dm_task_set_newuuid(dmt, " ")) // new uuid has no meaning here
+			log_warn("WARNING: Failed to query uuid with LIST.");
+		break;
+	default:
+		break;
+	}
 
 	if (!dm_task_run(dmt))
 		goto_out;
@@ -157,6 +171,7 @@ out:
 
 static int _get_segment_status_from_target_params(const char *target_name,
 						  const char *params,
+						  const struct dm_info *dminfo,
 						  struct lv_seg_status *seg_status)
 {
 	const struct lv_segment *seg = seg_status->seg;
@@ -189,7 +204,7 @@ static int _get_segment_status_from_target_params(const char *target_name,
 	    /* If kernel's type isn't an exact match is it compatible? */
 	    (!segtype->ops->target_status_compatible ||
 	     !segtype->ops->target_status_compatible(target_name))) {
-		log_warn(INTERNAL_ERROR "WARNING: Segment type %s found does not match expected type %s for %s.",
+		log_warn("WARNING: Detected %s segment type does not match expected type %s for %s.",
 			 target_name, segtype->name, display_lvname(seg_status->seg->lv));
 		return 0;
 	}
@@ -216,7 +231,7 @@ static int _get_segment_status_from_target_params(const char *target_name,
 			return_0;
 		seg_status->type = SEG_STATUS_SNAPSHOT;
 	} else if (segtype_is_vdo_pool(segtype)) {
-		if (!parse_vdo_pool_status(seg_status->mem, seg->lv, params, &seg_status->vdo_pool))
+		if (!parse_vdo_pool_status(seg_status->mem, seg->lv, params, dminfo, &seg_status->vdo_pool))
 			return_0;
 		seg_status->type = SEG_STATUS_VDO_POOL;
 	} else if (segtype_is_writecache(segtype)) {
@@ -320,7 +335,7 @@ static int _info_run(const char *dlid, struct dm_info *dminfo,
 		} while (target);
 
 		if (!target_name ||
-		    !_get_segment_status_from_target_params(target_name, target_params, seg_status))
+		    !_get_segment_status_from_target_params(target_name, target_params, dminfo, seg_status))
 			stack;
 	}
 
@@ -358,7 +373,8 @@ static int _info_run(const char *dlid, struct dm_info *dminfo,
  *
  * Returns: 1 if mirror should be ignored, 0 if safe to use
  */
-static int _ignore_blocked_mirror_devices(struct device *dev,
+static int _ignore_blocked_mirror_devices(struct cmd_context *cmd,
+					  struct device *dev,
 					  uint64_t start, uint64_t length,
 					  char *mirror_status_str)
 {
@@ -401,7 +417,7 @@ static int _ignore_blocked_mirror_devices(struct device *dev,
 				goto_out;
 
 			tmp_dev->dev = MKDEV(sm->logs[0].major, sm->logs[0].minor);
-			if (device_is_usable(tmp_dev, (struct dev_usable_check_params)
+			if (device_is_usable(cmd, tmp_dev, (struct dev_usable_check_params)
 					     { .check_empty = 1,
 					       .check_blocked = 1,
 					       .check_suspended = ignore_suspended_devices(),
@@ -605,6 +621,60 @@ static int _ignore_frozen_raid(struct device *dev, const char *params)
 	return r;
 }
 
+static int _is_usable_uuid(const struct device *dev, const char *name, const char *uuid, int check_reserved, int check_lv, int *is_lv)
+{
+	char *vgname, *lvname, *layer;
+	char vg_name[NAME_LEN];
+
+	if (!check_reserved && !check_lv)
+		return 1;
+
+	if (!strncmp(uuid, UUID_PREFIX, sizeof(UUID_PREFIX) - 1)) { /* with LVM- prefix */
+		if (check_reserved) {
+			/* Check internal lvm devices */
+			if (strlen(uuid) > (sizeof(UUID_PREFIX) + 2 * ID_LEN)) { /* 68 with suffix */
+				log_debug_activation("%s: Reserved uuid %s on internal LV device %s not usable.",
+						     dev_name(dev), uuid, name);
+				return 0;
+			}
+
+			/* Recognize some older reserved LVs just from the LV name (snapshot, pvmove...) */
+			vgname = vg_name;
+			if (!dm_strncpy(vg_name, name, sizeof(vg_name)) ||
+			    !dm_split_lvm_name(NULL, NULL, &vgname, &lvname, &layer))
+				return_0;
+
+			/* FIXME: fails to handle dev aliases i.e. /dev/dm-5, replace with UUID suffix */
+			if (lvname && (is_reserved_lvname(lvname) || *layer)) {
+				log_debug_activation("%s: Reserved internal LV device %s/%s%s%s not usable.",
+						     dev_name(dev), vgname, lvname, *layer ? "-" : "", layer);
+				return 0;
+			}
+		}
+
+		if (check_lv) {
+			/* Skip LVs */
+			if (is_lv)
+				*is_lv = 1;
+			return 0;
+		}
+	}
+
+	if (check_reserved &&
+	    (!strncmp(uuid, CRYPT_TEMP, sizeof(CRYPT_TEMP) - 1) ||
+	     !strncmp(uuid, CRYPT_SUBDEV, sizeof(CRYPT_SUBDEV) - 1) ||
+	     !strncmp(uuid, STRATIS, sizeof(STRATIS) - 1))) {
+		/* Skip private crypto devices */
+		log_debug_activation("%s: Reserved uuid %s on %s device %s not usable.",
+				     dev_name(dev), uuid,
+				     uuid[0] == 'C' ? "crypto" : "stratis",
+				     name);
+		return 0;
+	}
+
+        return 1;
+}
+
 /*
  * device_is_usable
  * @dev
@@ -621,15 +691,14 @@ static int _ignore_frozen_raid(struct device *dev, const char *params)
  *
  * Returns: 1 if usable, 0 otherwise
  */
-int device_is_usable(struct device *dev, struct dev_usable_check_params check, int *is_lv)
+int device_is_usable(struct cmd_context *cmd, struct device *dev, struct dev_usable_check_params check, int *is_lv)
 {
 	struct dm_task *dmt;
 	struct dm_info info;
 	const char *name, *uuid;
 	uint64_t start, length;
 	char *target_type = NULL;
-	char *params, *vgname, *lvname, *layer;
-	char vg_name[NAME_LEN];
+	char *params;
 	void *next = NULL;
 	int only_error_or_zero_target = 1;
 	int r = 0;
@@ -654,50 +723,9 @@ int device_is_usable(struct device *dev, struct dev_usable_check_params check, i
 		goto out;
 	}
 
-	if (uuid && (check.check_reserved || check.check_lv)) {
-		if (!strncmp(uuid, UUID_PREFIX, sizeof(UUID_PREFIX) - 1)) { /* with LVM- prefix */
-			if (check.check_reserved) {
-				/* Check internal lvm devices */
-				if (strlen(uuid) > (sizeof(UUID_PREFIX) + 2 * ID_LEN)) { /* 68 with suffix */
-					log_debug_activation("%s: Reserved uuid %s on internal LV device %s not usable.",
-							     dev_name(dev), uuid, name);
-					goto out;
-				}
-
-				/* Recognize some older reserved LVs just from the LV name (snapshot, pvmove...) */
-				vgname = vg_name;
-				if (!dm_strncpy(vg_name, name, sizeof(vg_name)) ||
-				    !dm_split_lvm_name(NULL, NULL, &vgname, &lvname, &layer))
-					goto_out;
-
-				/* FIXME: fails to handle dev aliases i.e. /dev/dm-5, replace with UUID suffix */
-				if (lvname && (is_reserved_lvname(lvname) || *layer)) {
-					log_debug_activation("%s: Reserved internal LV device %s/%s%s%s not usable.",
-							     dev_name(dev), vgname, lvname, *layer ? "-" : "", layer);
-					goto out;
-				}
-			}
-
-			if (check.check_lv) {
-				/* Skip LVs */
-				if (is_lv)
-					*is_lv = 1;
-				goto out;
-			}
-		}
-
-		if (check.check_reserved &&
-		    (!strncmp(uuid, CRYPT_TEMP, sizeof(CRYPT_TEMP) - 1) ||
-		     !strncmp(uuid, CRYPT_SUBDEV, sizeof(CRYPT_SUBDEV) - 1) ||
-		     !strncmp(uuid, STRATIS, sizeof(STRATIS) - 1))) {
-			/* Skip private crypto devices */
-			log_debug_activation("%s: Reserved uuid %s on %s device %s not usable.",
-					     dev_name(dev), uuid,
-					     uuid[0] == 'C' ? "crypto" : "stratis",
-					     name);
-			goto out;
-		}
-	}
+	if (uuid &&
+	    !_is_usable_uuid(dev, name, uuid, check.check_reserved, check.check_lv, is_lv))
+		goto out;
 
 	/* FIXME Also check for mpath no paths */
 	do {
@@ -712,7 +740,7 @@ int device_is_usable(struct device *dev, struct dev_usable_check_params check, i
 				log_debug_activation("%s: Scanning mirror devices is disabled.", dev_name(dev));
 				goto out;
 			}
-			if (!_ignore_blocked_mirror_devices(dev, start,
+			if (!_ignore_blocked_mirror_devices(cmd, dev, start,
 							    length, params)) {
 				log_debug_activation("%s: Mirror device %s not usable.",
 						     dev_name(dev), name);
@@ -837,7 +865,7 @@ static int _info(struct cmd_context *cmd,
 		return 1;
 
 	/* Check for original version of dlid before the suffixes got added in 2.02.106 */
-	if ((suffix_position = rindex(dlid, '-'))) {
+	if ((suffix_position = strrchr(dlid, '-'))) {
 		while ((suffix = uuid_suffix_list[i++])) {
 			if (strcmp(suffix_position + 1, suffix))
 				continue;
@@ -908,6 +936,25 @@ int dev_manager_check_prefix_dm_major_minor(uint32_t major, uint32_t minor, cons
 	return r;
 }
 
+int dev_manager_get_device_list(const char *prefix, struct dm_list **devs, unsigned *devs_features)
+{
+	struct dm_task *dmt;
+	int r = 1;
+
+	if (!(dmt = _setup_task_run(DM_DEVICE_LIST, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0)))
+		return_0;
+
+	if (!dm_task_get_device_list(dmt, devs, devs_features)) {
+		r = 0;
+		goto_out;
+	}
+
+    out:
+	dm_task_destroy(dmt);
+
+	return r;
+}
+
 int dev_manager_info(struct cmd_context *cmd,
 		     const struct logical_volume *lv, const char *layer,
 		     int with_open_count, int with_read_ahead, int with_name_check,
@@ -922,6 +969,16 @@ int dev_manager_info(struct cmd_context *cmd,
 
 	if (!(dlid = build_dm_uuid(cmd->mem, lv, layer)))
 		goto_out;
+
+	if (!cmd->disable_dm_devs &&
+	    cmd->cache_dm_devs &&
+	    !dm_device_list_find_by_uuid(cmd->cache_dm_devs, dlid, NULL)) {
+		log_debug("Cached as inactive %s.", name);
+		if (dminfo)
+			memset(dminfo, 0, sizeof(*dminfo));
+		r = 1;
+		goto out;
+	}
 
 	if (!(r = _info(cmd, name, dlid,
 			with_open_count, with_read_ahead, with_name_check,
@@ -1886,7 +1943,7 @@ int dev_manager_vdo_pool_status(struct dev_manager *dm,
 		goto out;
 	}
 
-	if (!parse_vdo_pool_status(dm->mem, lv, params, *status))
+	if (!parse_vdo_pool_status(dm->mem, lv, params, &info, *status))
 		goto_out;
 
 	(*status)->mem = dm->mem;
@@ -2118,7 +2175,7 @@ static int _check_holder(struct dev_manager *dm, struct dm_tree *dtree,
 		if (!strncmp(default_uuid_prefix, uuid, default_uuid_prefix_len))
 			uuid += default_uuid_prefix_len;
 
-		if (!strncmp(uuid, (char*)&lv->vg->id, sizeof(lv->vg->id)) &&
+		if (!memcmp(uuid, &lv->vg->id, ID_LEN) &&
 		    !dm_tree_find_node_by_uuid(dtree, uuid)) {
 			/* trims any UUID suffix (i.e. -cow) */
 			(void) dm_strncpy((char*)&id, uuid, 2 * sizeof(struct id) + 1);
@@ -2197,6 +2254,7 @@ static int _add_dev_to_dtree(struct dev_manager *dm, struct dm_tree *dtree,
 {
 	char *dlid, *name;
 	struct dm_info info, info2;
+	const struct dm_active_device *dev;
 
 	if (!(name = dm_build_dm_name(dm->mem, lv->vg->name, lv->name, layer)))
 		return_0;
@@ -2204,9 +2262,21 @@ static int _add_dev_to_dtree(struct dev_manager *dm, struct dm_tree *dtree,
 	if (!(dlid = build_dm_uuid(dm->track_pending_delete ? dm->cmd->pending_delete_mem : dm->mem, lv, layer)))
 		return_0;
 
-	if (!_info(dm->cmd, name, dlid, 1, 0, 0, &info, NULL, NULL))
+	if (!dm->cmd->disable_dm_devs &&
+	    dm->cmd->cache_dm_devs) {
+		if (!dm_device_list_find_by_uuid(dm->cmd->cache_dm_devs, dlid, &dev)) {
+			log_debug("Cached as not present %s.", name);
+			return 1;
+		}
+		info = (struct dm_info) {
+			.exists = 1,
+			.major = dev->major,
+			.minor = dev->minor,
+		};
+		log_debug("Cached as present %s %s (%d:%d).",
+			  name, dlid, info.major, info.minor);
+	} else if (!_info(dm->cmd, name, dlid, 0, 0, 0, &info, NULL, NULL))
 		return_0;
-
 	/*
 	 * For top level volumes verify that existing device match
 	 * requested major/minor and that major/minor pair is available for use
@@ -2349,6 +2419,9 @@ static int _pool_callback(struct dm_tree_node *node,
 			return 0;
 		}
 	}
+
+	dm_device_list_destroy(&cmd->cache_dm_devs); /* Cache no longer valid */
+
 	log_debug("Running check command on %s", mpath);
 
 	if (data->skip_zero) {
@@ -2874,6 +2947,10 @@ int add_areas_line(struct dev_manager *dm, struct lv_segment *seg,
 
 	/* FIXME Avoid repeating identical stat in dm_tree_node_add_target_area */
 	for (s = start_area; s < areas; s++) {
+
+		/* FIXME: dev_name() does not return NULL!  It needs to check if dm_list_empty(&dev->aliases)
+		   but this knot of logic is too complex to pull apart without careful deconstruction. */
+
 		if ((seg_type(seg, s) == AREA_PV &&
 		     (!seg_pvseg(seg, s) || !seg_pv(seg, s) || !seg_dev(seg, s) ||
 		       !(name = dev_name(seg_dev(seg, s))) || !*name ||
@@ -2892,7 +2969,10 @@ int add_areas_line(struct dev_manager *dm, struct lv_segment *seg,
 				return_0;
 			num_error_areas++;
 		} else if (seg_type(seg, s) == AREA_PV) {
-			if (!dm_tree_node_add_target_area(node, dev_name(seg_dev(seg, s)), NULL,
+			struct device *dev = seg_dev(seg, s);
+			name = dm_list_empty(&dev->aliases) ? NULL : dev_name(dev);
+
+			if (!dm_tree_node_add_target_area(node, name, NULL,
 				    (seg_pv(seg, s)->pe_start + (extent_size * seg_pe(seg, s)))))
 				return_0;
 			num_existing_areas++;
@@ -3736,6 +3816,7 @@ static int _tree_action(struct dev_manager *dm, const struct logical_volume *lv,
 	struct dm_tree_node *root;
 	char *dlid;
 	int r = 0;
+	unsigned tmp_state;
 
 	if (action < DM_ARRAY_SIZE(_action_names))
 		log_debug_activation("Creating %s%s tree for %s.",
@@ -3755,8 +3836,16 @@ static int _tree_action(struct dev_manager *dm, const struct logical_volume *lv,
 	dm->suspend = (action == SUSPEND_WITH_LOCKFS) || (action == SUSPEND);
 	dm->track_external_lv_deps = 1;
 
+	/* ATM do not use caching for anything else then striped target.
+	 * And also skip for CLEAN action */
+	tmp_state = dm->cmd->disable_dm_devs;
+	if (!seg_is_striped_target(first_seg(lv)) || (action == CLEAN))
+		dm->cmd->disable_dm_devs = 1;
+
 	if (!(dtree = _create_partial_dtree(dm, lv, laopts->origin_only)))
 		return_0;
+
+	dm->cmd->disable_dm_devs = tmp_state;
 
 	if (!(root = dm_tree_find_node(dtree, 0, 0))) {
 		log_error("Lost dependency tree root node.");

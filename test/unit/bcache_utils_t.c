@@ -26,7 +26,7 @@
 
 //----------------------------------------------------------------
 
-#define T_BLOCK_SIZE sysconf(_SC_PAGESIZE)
+#define T_BLOCK_SIZE (PAGE_SIZE)
 #define NR_BLOCKS 64
 #define INIT_PATTERN 123
 
@@ -49,34 +49,44 @@ static uint64_t byte(block_address b, uint64_t offset)
 
 static void *_fix_init(struct io_engine *engine)
 {
-        uint8_t buffer[T_BLOCK_SIZE];
-        struct fixture *f = malloc(sizeof(*f));
-        unsigned b, i;
-	struct statvfs fsdata;
+	uint8_t buffer[T_BLOCK_SIZE];
+	struct fixture *f = malloc(sizeof(*f));
+	unsigned b, i;
 	static int _runs_is_tmpfs = -1;
 
+	memset(buffer, 0, sizeof(buffer));
+	T_ASSERT(f);
+
 	if (_runs_is_tmpfs == -1) {
-		// With testing in tmpfs directory O_DIRECT cannot be used
-		// tmpfs has  f_fsid == 0  (unsure if this is best guess)
-		_runs_is_tmpfs = (statvfs(".", &fsdata) == 0 && !fsdata.f_fsid) ? 1 : 0;
-		if (_runs_is_tmpfs)
+		snprintf(f->fname, sizeof(f->fname), "unit-test-XXXXXX");
+		/* coverity[secure_temp] don't care */
+		f->fd = mkstemp(f->fname);
+		T_ASSERT(f->fd >= 0);
+		(void) close(f->fd);
+		// test if we can reopen with O_DIRECT
+		if ((f->fd = open(f->fname, O_RDWR | O_DIRECT)) >= 0) {
+			_runs_is_tmpfs = 0;
+			(void) close(f->fd);
+		} else {
+			_runs_is_tmpfs = 1; // likely running on tmpfs
 			printf("  Running test in tmpfs, *NOT* using O_DIRECT\n");
+		}
+		(void) unlink(f->fname);
 	}
 
-        T_ASSERT(f);
-
-        snprintf(f->fname, sizeof(f->fname), "unit-test-XXXXXX");
+	snprintf(f->fname, sizeof(f->fname), "unit-test-XXXXXX");
+	/* coverity[secure_temp] don't care */
 	f->fd = mkstemp(f->fname);
 	T_ASSERT(f->fd >= 0);
 
 	for (b = 0; b < NR_BLOCKS; b++) {
-        	for (i = 0; i < sizeof(buffer); i++)
-                	buffer[i] = _pattern_at(INIT_PATTERN, byte(b, i));
+		for (i = 0; i < sizeof(buffer); i++)
+			buffer[i] = _pattern_at(INIT_PATTERN, byte(b, i));
 		T_ASSERT(write(f->fd, buffer, T_BLOCK_SIZE) > 0);
 	}
 
 	if (!_runs_is_tmpfs) {
-		close(f->fd);
+		(void) close(f->fd);
 		// reopen with O_DIRECT
 		f->fd = open(f->fname, O_RDWR | O_DIRECT);
 		T_ASSERT(f->fd >= 0);
@@ -87,7 +97,7 @@ static void *_fix_init(struct io_engine *engine)
 
 	f->di = bcache_set_fd(f->fd);
 
-        return f;
+	return f;
 }
 
 static void *_async_init(void)
@@ -108,11 +118,13 @@ static void _fix_exit(void *fixture)
 {
         struct fixture *f = fixture;
 
-	bcache_destroy(f->cache);
-	close(f->fd);
-	bcache_clear_fd(f->di);
-	unlink(f->fname);
-        free(f);
+	if (f) {
+		bcache_destroy(f->cache);
+		(void) close(f->fd);
+		bcache_clear_fd(f->di);
+		(void) unlink(f->fname);
+		free(f);
+	}
 }
 
 //----------------------------------------------------------------
@@ -144,6 +156,10 @@ static void _verify(struct fixture *f, uint64_t byte_b, uint64_t byte_e, uint8_t
         	unsigned i;
         	size_t len2 = byte_e - byte_b;
 		uint8_t *buffer = malloc(len2);
+
+		T_ASSERT(buffer);
+		memset(buffer, 0, len2);
+
 		T_ASSERT(bcache_read_bytes(f->cache, f->di, byte_b, len2, buffer));
 		for (i = 0; i < len; i++)
         		T_ASSERT_EQUAL(buffer[i], _pattern_at(pat, byte_b + i));
@@ -197,7 +213,9 @@ static void _do_write(struct fixture *f, uint64_t byte_b, uint64_t byte_e, uint8
         unsigned i;
         size_t len = byte_e - byte_b;
         uint8_t *buffer = malloc(len);
-        T_ASSERT(buffer);
+
+	T_ASSERT(buffer);
+	memset(buffer, 0, len);
 
         for (i = 0; i < len; i++)
 		buffer[i] = _pattern_at(pat, byte_b + i);
@@ -234,6 +252,7 @@ static void _reopen(struct fixture *f)
 
 static uint8_t _random_pattern(void)
 {
+	/* coverity[dont_call] don't care */
 	return random();
 }
 
@@ -333,7 +352,7 @@ static void _test_zero_many_boundaries(void *fixture)
 
 static void _set_cycle(struct fixture *f, uint64_t b, uint64_t e)
 {
-	uint8_t val = random();
+	uint8_t val = _random_pattern();
 
 	_verify(f, b, e, INIT_PATTERN);
 	_do_set(f, b, e, val); 

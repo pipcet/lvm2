@@ -395,9 +395,6 @@ int add_pv_to_vg(struct volume_group *vg, const char *pv_name,
 struct logical_volume *find_lv_in_vg_by_lvid(const struct volume_group *vg,
 					     const union lvid *lvid);
 
-struct lv_list *find_lv_in_lv_list(const struct dm_list *ll,
-				   const struct logical_volume *lv);
-
 /* FIXME Merge these functions with ones above */
 struct physical_volume *find_pv(struct volume_group *vg, struct device *dev);
 
@@ -531,11 +528,15 @@ int update_pool_metadata_min_max(struct cmd_context *cmd,
  */
 struct id pv_id(const struct physical_volume *pv);
 const struct format_type *pv_format_type(const struct physical_volume *pv);
-struct id pv_vgid(const struct physical_volume *pv);
+struct id pv_vg_id(const struct physical_volume *pv);
 
 uint64_t find_min_mda_size(struct dm_list *mdas);
 char *tags_format_and_copy(struct dm_pool *mem, const struct dm_list *tagsl);
 
 void set_pv_devices(struct format_instance *fid, struct volume_group *vg);
+
+int get_visible_lvs_using_pv(struct cmd_context *cmd, struct volume_group *vg, struct device *dev,
+                            struct dm_list *lvs_list);
+
 
 #endif

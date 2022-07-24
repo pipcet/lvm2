@@ -22,6 +22,7 @@
 #include "lib/locking/lvmlockd.h"
 #include "lib/datastruct/str_list.h"
 
+/* coverity[unnecessary_header] */
 #include "stub.h"
 #include "lib/misc/last-path-component.h"
 
@@ -2016,6 +2017,8 @@ out:
 	log_debug("Recognised command %s (id %d / enum %d).",
 		  commands[best_i].command_id, best_i, commands[best_i].command_enum);
 
+	log_command(cmd->cmd_line, commands[best_i].name, commands[best_i].command_id);
+
 	return &commands[best_i];
 }
 
@@ -2235,7 +2238,7 @@ static int _process_command_line(struct cmd_context *cmd, int *argc, char ***arg
 	*ptr = '\0';
 	memset(o, 0, sizeof(*o));
 
-	optarg = 0;
+	optarg = (char*) "";
 	optind = OPTIND_INIT;
 	while ((goval = GETOPTLONG_FN(*argc, *argv, str, opts, NULL)) >= 0) {
 
@@ -2390,6 +2393,11 @@ static void _reset_current_settings_to_default(struct cmd_context *cmd)
 
 static void _get_current_output_settings_from_args(struct cmd_context *cmd)
 {
+	if (arg_is_set(cmd, udevoutput_ARG)) {
+		cmd->current_settings.suppress = 1;
+		cmd->udevoutput = 1;
+	}
+
 	if (arg_is_set(cmd, debug_ARG))
 		cmd->current_settings.debug = _LOG_FATAL + (arg_count(cmd, debug_ARG) - 1);
 
@@ -2401,14 +2409,25 @@ static void _get_current_output_settings_from_args(struct cmd_context *cmd)
 		cmd->current_settings.verbose = 0;
 		cmd->current_settings.silent = (arg_count(cmd, quiet_ARG) > 1) ? 1 : 0;
 	}
+
+	/*
+	 * default_settings.journal is already set from config and has already been
+	 * applied using init_log_journal().
+	 * current_settings have been set to default_settings.
+	 * now --journal value adds to current_settings.
+	 */
+	if (arg_is_set(cmd, journal_ARG))
+		cmd->current_settings.journal |= log_journal_str_to_val(arg_str_value(cmd, journal_ARG, ""));
 }
 
 static void _apply_current_output_settings(struct cmd_context *cmd)
 {
+	log_suppress(cmd->current_settings.suppress);
 	init_debug(cmd->current_settings.debug);
 	init_debug_classes_logged(cmd->default_settings.debug_classes);
 	init_verbose(cmd->current_settings.verbose + VERBOSE_BASE_LEVEL);
 	init_silent(cmd->current_settings.silent);
+	init_log_journal(cmd->current_settings.journal);
 }
 
 static int _read_devices_list(struct cmd_context *cmd)
@@ -2446,6 +2465,8 @@ static int _get_current_settings(struct cmd_context *cmd)
 	if (arg_is_set(cmd, test_ARG))
 		cmd->current_settings.test = arg_is_set(cmd, test_ARG);
 
+	cmd->current_settings.yes = arg_count(cmd, yes_ARG);
+
 	if (arg_is_set(cmd, driverloaded_ARG)) {
 		cmd->current_settings.activation =
 		    arg_int_value(cmd, driverloaded_ARG,
@@ -2472,6 +2493,10 @@ static int _get_current_settings(struct cmd_context *cmd)
 	cmd->scan_lvs = find_config_tree_bool(cmd, devices_scan_lvs_CFG, NULL);
 
 	cmd->allow_mixed_block_sizes = find_config_tree_bool(cmd, devices_allow_mixed_block_sizes_CFG, NULL);
+
+	cmd->check_devs_used = (cmd->cname->flags & CHECK_DEVS_USED) ? 1 : 0;
+
+	cmd->print_device_id_not_found = (cmd->cname->flags & DEVICE_ID_NOT_FOUND) ? 1 : 0;
 
 	/*
 	 * enable_hints is set to 1 if any commands are using hints.
@@ -2503,6 +2528,14 @@ static int _get_current_settings(struct cmd_context *cmd)
 	 * Hints are only effective when devices are in a steady-state.
 	 */
 	if (arg_is_set(cmd, sysinit_ARG))
+		cmd->use_hints = 0;
+
+	/*
+	 * Don't use hints from this command, but enable_hints will
+	 * remain set unless hints=none in the config.  See above re
+	 * the meaning of use_hints=0 && enable_hints=1.
+	 */
+	if (arg_is_set(cmd, nohints_ARG))
 		cmd->use_hints = 0;
 
 	if ((hint_mode = find_config_tree_str(cmd, devices_hints_CFG, NULL))) {
@@ -3020,7 +3053,6 @@ int lvm_run_command(struct cmd_context *cmd, int argc, char **argv)
 	struct dm_config_tree *config_string_cft, *config_profile_command_cft, *config_profile_metadata_cft;
 	int ret = 0;
 	int locking_type;
-	int nolocking = 0;
 	int readonly = 0;
 	int sysinit = 0;
 	int monitoring;
@@ -3028,6 +3060,12 @@ int lvm_run_command(struct cmd_context *cmd, int argc, char **argv)
 	int i;
 	int skip_hyphens;
 	int refresh_done = 0;
+	int io;
+
+	/* Avoid excessive access to /etc/localtime and set TZ variable for glibc
+	 * so it does not need to check /etc/localtime everytime that needs that info */
+	if (!getenv("TZ"))
+		setenv("TZ", ":/etc/localtime", 0);
 
 	init_error_message_produced(0);
 
@@ -3104,6 +3142,20 @@ int lvm_run_command(struct cmd_context *cmd, int argc, char **argv)
 
 	if (!(cmd->command = _find_command(cmd, cmd->name, &argc, argv)))
 		return EINVALID_CMD_LINE;
+
+	/*
+	 * If option --foo is set which is listed in IO (ignore option) in
+	 * command-lines.in, then unset foo.  Commands won't usually use an
+	 * ignored option, but there can be shared code that checks for --foo,
+	 * and should not find it to be set.
+	 */
+	for (io = 0; io < cmd->command->io_count; io++) {
+		int opt = cmd->command->ignore_opt_args[io].opt;
+		if (arg_is_set(cmd, opt)) {
+			log_debug("Ignore opt %d", opt);
+			cmd->opt_arg_values[opt].count = 0;
+		}
+	}
 
 	/*
 	 * Remaining position args after command name and --options are removed.
@@ -3184,6 +3236,12 @@ int lvm_run_command(struct cmd_context *cmd, int argc, char **argv)
 		goto out;
 	}
 
+	cmd->ignorelockingfailure = arg_is_set(cmd, ignorelockingfailure_ARG);
+	cmd->nolocking = arg_is_set(cmd, nolocking_ARG);
+
+	if (_cmd_no_meta_proc(cmd))
+		cmd->nolocking = 1;
+
 	/* Defaults to 1 if not set. */
 	locking_type = find_config_tree_int(cmd, global_locking_type_CFG, NULL);
 
@@ -3192,7 +3250,7 @@ int lvm_run_command(struct cmd_context *cmd, int argc, char **argv)
 
 	if ((locking_type == 0) || (locking_type == 5)) {
 		log_warn("WARNING: locking_type (%d) is deprecated, using --nolocking.", locking_type);
-		nolocking = 1;
+		cmd->nolocking = 1;
 
 	} else if (locking_type == 4) {
 		log_warn("WARNING: locking_type (%d) is deprecated, using --sysinit --readonly.", locking_type);
@@ -3203,28 +3261,25 @@ int lvm_run_command(struct cmd_context *cmd, int argc, char **argv)
 		log_warn("WARNING: locking_type (%d) is deprecated, using file locking.", locking_type);
 	}
 
-	cmd->nolocking = arg_is_set(cmd, nolocking_ARG);
-
-	if (cmd->nolocking || _cmd_no_meta_proc(cmd))
-		nolocking = 1;
-
 	if ((cmd->sysinit = arg_is_set(cmd, sysinit_ARG)))
 		sysinit = 1;
 
 	if (arg_is_set(cmd, readonly_ARG))
 		readonly = 1;
 
-	if (nolocking) {
-		if (!_cmd_no_meta_proc(cmd))
-			log_warn("WARNING: File locking is disabled.");
-	} else {
-		if (!init_locking(cmd, sysinit, readonly, arg_is_set(cmd, ignorelockingfailure_ARG))) {
+	if (!cmd->nolocking) {
+		if (!init_locking(cmd, sysinit, readonly, cmd->ignorelockingfailure)) {
 			ret = ECMD_FAILED;
 			goto_out;
 		}
 	}
 
 	_init_md_checks(cmd);
+
+	if (!dev_mpath_init(find_config_tree_str_allow_empty(cmd, devices_multipath_wwids_file_CFG, NULL))) {
+		ret = ECMD_FAILED;
+		goto_out;
+	}
 
 	if (!_cmd_no_meta_proc(cmd) && !_init_lvmlockd(cmd)) {
 		ret = ECMD_FAILED;
@@ -3246,6 +3301,7 @@ int lvm_run_command(struct cmd_context *cmd, int argc, char **argv)
 
       out:
 
+	dev_mpath_exit();
 	hints_exit(cmd);
 	lvmcache_destroy(cmd, 1, 1);
 	label_scan_destroy(cmd);
@@ -3276,8 +3332,8 @@ int lvm_run_command(struct cmd_context *cmd, int argc, char **argv)
 	 * ignore everything supplied on the command line of the
 	 * completed command.
 	 */
-	_reset_current_settings_to_default(cmd);
-	_apply_current_settings(cmd);
+	//_reset_current_settings_to_default(cmd);
+	//_apply_current_settings(cmd);
 
 	/*
 	 * free off any memory the command used.
@@ -3539,9 +3595,6 @@ struct cmd_context *init_lvm(unsigned set_connections,
 {
 	struct cmd_context *cmd;
 
-	if (!udev_init_library_context())
-		stack;
-
 	/*
 	 * It's not necessary to use name mangling for LVM:
 	 *   - the character set used for LV names is subset of udev character set
@@ -3549,9 +3602,7 @@ struct cmd_context *init_lvm(unsigned set_connections,
 	 */
 	dm_set_name_mangling_mode(DM_STRING_MANGLING_NONE);
 
-	if (!(cmd = create_toolcontext(0, NULL, 1, threaded,
-			set_connections, set_filters))) {
-		udev_fin_library_context();
+	if (!(cmd = create_toolcontext(0, NULL, 1, threaded, set_connections, set_filters))) {
 		return_NULL;
 	}
 
@@ -3559,7 +3610,6 @@ struct cmd_context *init_lvm(unsigned set_connections,
 
 	if (stored_errno()) {
 		destroy_toolcontext(cmd);
-		udev_fin_library_context();
 		return_NULL;
 	}
 
@@ -3580,6 +3630,8 @@ static int _run_script(struct cmd_context *cmd, int argc, char **argv)
 	int ret = ENO_SUCH_CMD;
 	int magic_number = 0;
 	char *script_file = argv[0];
+	int largc;
+	char *largv[MAX_ARGS];
 
 	if ((script = fopen(script_file, "r")) == NULL)
 		return ENO_SUCH_CMD;
@@ -3601,17 +3653,17 @@ static int _run_script(struct cmd_context *cmd, int argc, char **argv)
 			ret = EINVALID_CMD_LINE;
 			break;
 		}
-		if (lvm_split(buffer, &argc, argv, MAX_ARGS) == MAX_ARGS) {
+		if (lvm_split(buffer, &largc, largv, MAX_ARGS) == MAX_ARGS) {
 			buffer[50] = '\0';
 			log_error("Too many arguments: %s", buffer);
 			ret = EINVALID_CMD_LINE;
 			break;
 		}
-		if (!argc)
+		if (!largc)
 			continue;
-		if (!strcmp(argv[0], "quit") || !strcmp(argv[0], "exit"))
+		if (!strcmp(largv[0], "quit") || !strcmp(largv[0], "exit"))
 			break;
-		ret = lvm_run_command(cmd, argc, argv);
+		ret = lvm_run_command(cmd, largc, largv);
 		/*
 		 * FIXME: handling scripts with invalid or failing commands
 		 * could use some cleaning up, e.g. error_message_produced

@@ -438,18 +438,11 @@ static void free_pvs_path(struct pvs *pvs)
 {
 	int i;
 
-	for (i = 0; i < pvs->num; i++) {
-		if (!pvs->path[i])
-			continue;
-
+	for (i = 0; i < pvs->num; i++)
 		free((char *)pvs->path[i]);
-		pvs->path[i] = NULL;
-	}
 
-	if (!pvs->path) {
-		free(pvs->path);
-		pvs->path = NULL;
-	}
+	free(pvs->path);
+	pvs->path = NULL;
 }
 
 static char **alloc_and_copy_pvs_path(struct pvs *dst, struct pvs *src)
@@ -563,10 +556,8 @@ static struct lock *alloc_lock(void)
 
 static void free_action(struct action *act)
 {
-	if (act->path) {
-		free(act->path);
-		act->path = NULL;
-	}
+	free(act->path);
+	act->path = NULL;
 
 	free_pvs_path(&act->pvs);
 
@@ -928,7 +919,7 @@ static void write_adopt_file(void)
 	pthread_mutex_unlock(&lockspaces_mutex);
 
 	fflush(fp);
-	fclose(fp);
+	(void) fclose(fp);
 }
 
 static int read_adopt_file(struct list_head *vg_lockd)
@@ -965,13 +956,16 @@ static int read_adopt_file(struct list_head *vg_lockd)
 
 			if (sscanf(adopt_line, "VG: %63s %64s %15s %64s",
 				   vg_uuid, ls->vg_name, lm_type_str, ls->vg_args) != 4) {
+				free(ls);
 				goto fail;
 			}
 
 			memcpy(ls->vg_uuid, vg_uuid, 64);
 
-			if ((ls->lm_type = str_to_lm(lm_type_str)) < 0)
+			if ((ls->lm_type = str_to_lm(lm_type_str)) < 0) {
+				free(ls);
 				goto fail;
+			}
 
 			list_add(&ls->list, vg_lockd);
 
@@ -986,11 +980,14 @@ static int read_adopt_file(struct list_head *vg_lockd)
 
 			if (sscanf(adopt_line, "LV: %64s %64s %s %7s %u",
 				   vg_uuid, r->name, r->lv_args, mode, &r->version) != 5) {
+				free_resource(r);
 				goto fail;
 			}
 
-			if ((r->adopt_mode = str_to_mode(mode)) == LD_LK_IV)
+			if ((r->adopt_mode = str_to_mode(mode)) == LD_LK_IV) {
+				free_resource(r);
 				goto fail;
+			}
 
 			if (ls && !memcmp(ls->vg_uuid, vg_uuid, 64)) {
 				list_add(&r->list, &ls->resources);
@@ -1007,16 +1004,17 @@ static int read_adopt_file(struct list_head *vg_lockd)
 
 			if (r) {
 				log_error("No lockspace found for resource %s vg_uuid %s", r->name, vg_uuid);
+				free_resource(r);
 				goto fail;
 			}
 		}
 	}
 
-	fclose(fp);
+	(void) fclose(fp);
 	return 0;
 
 fail:
-	fclose(fp);
+	(void) fclose(fp);
 	return -1;
 }
 
@@ -2982,6 +2980,7 @@ static int add_lockspace_thread(const char *ls_name,
 	}
 
 	if (vg_uuid)
+		/* coverity[buffer_size_warning] */
 		strncpy(ls->vg_uuid, vg_uuid, 64);
 
 	if (vg_name)
@@ -3017,9 +3016,7 @@ static int add_lockspace_thread(const char *ls_name,
 				!alloc_and_copy_pvs_path(&ls2->pvs, &ls->pvs)) {
 			log_debug("add_lockspace_thread %s fails to allocate pvs", ls->name);
 			rv = -ENOMEM;
-		}
-
-		if (ls2->thread_stop) {
+		} else if (ls2->thread_stop) {
 			log_debug("add_lockspace_thread %s exists and stopping", ls->name);
 			rv = -EAGAIN;
 		} else if (!ls2->create_fail && !ls2->create_done) {
@@ -4780,7 +4777,7 @@ static void client_recv_action(struct client *cl)
 	const char *path;
 	const char *str;
 	struct pvs pvs;
-	char buf[17];	/* "path[%d]\0", %d outputs signed integer so max to 10 bytes */
+	char buf[18];	/* "path[%d]\0", %d outputs signed integer so max to 10 bytes */
 	int64_t val;
 	uint32_t opts = 0;
 	int result = 0;
@@ -6272,6 +6269,7 @@ int main(int argc, char *argv[])
 		.daemon_fini = NULL,
 		.daemon_main = main_loop,
 	};
+	daemon_host_id_file = NULL;
 
 	static struct option long_options[] = {
 		{"help",            no_argument,       0, 'h' },
@@ -6305,6 +6303,7 @@ int main(int argc, char *argv[])
 		case '0':
 			break;
 		case 128:
+			free((void *) adopt_file);
 			adopt_file = strdup(optarg);
 			break;
 		case 'h':
@@ -6324,9 +6323,11 @@ int main(int argc, char *argv[])
 			daemon_debug = 1;
 			break;
 		case 'p':
+			free((void*)ds.pidfile);
 			ds.pidfile = strdup(optarg);
 			break;
 		case 's':
+			free((void*)ds.socket_path);
 			ds.socket_path = strdup(optarg);
 			break;
 		case 'g':
@@ -6346,6 +6347,7 @@ int main(int argc, char *argv[])
 			daemon_host_id = atoi(optarg);
 			break;
 		case 'F':
+			free((void*)daemon_host_id_file);
 			daemon_host_id_file = strdup(optarg);
 			break;
 		case 'o':

@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2001 - 2003 Sistina Software (UK) Limited.
- * Copyright (C) 2004 - 2017 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2004 - 2021 Red Hat, Inc. All rights reserved.
  *
  * This file is released under the LGPL.
  */
@@ -183,7 +183,7 @@ struct dm_target_spec {
 struct dm_target_deps {
 	uint32_t count;	/* Array size */
 	uint32_t padding;	/* unused */
-	uint64_t dev[];		/* out */
+	uint64_t dev[0];	/* out */
 };
 
 /*
@@ -193,8 +193,22 @@ struct dm_name_list {
 	uint64_t dev;
 	uint32_t next;		/* offset to the next record from
 				   the _start_ of this */
-	char name[];
+	char name[0];
+
+	/*
+	 * The following members can be accessed by taking a pointer that
+	 * points immediately after the terminating zero character in "name"
+	 * and aligning this pointer to next 8-byte boundary.
+	 * Uuid is present if the flag DM_NAME_LIST_FLAG_HAS_UUID is set.
+	 *
+	 * uint32_t event_nr;
+	 * uint32_t flags;
+	 * char uuid[0];
+	 */
 };
+
+#define DM_NAME_LIST_FLAG_HAS_UUID		1
+#define DM_NAME_LIST_FLAG_DOESNT_HAVE_UUID	2
 
 /*
  * Used to retrieve the target versions
@@ -203,7 +217,7 @@ struct dm_target_versions {
         uint32_t next;
         uint32_t version[3];
 
-        char name[];
+        char name[0];
 };
 
 /*
@@ -212,7 +226,7 @@ struct dm_target_versions {
 struct dm_target_msg {
 	uint64_t sector;	/* Device sector */
 
-	char message[];
+	char message[0];
 };
 
 /*
@@ -273,9 +287,9 @@ enum {
 #define DM_GET_TARGET_VERSION	_IOWR(DM_IOCTL, DM_GET_TARGET_VERSION_CMD, struct dm_ioctl)
 
 #define DM_VERSION_MAJOR	4
-#define DM_VERSION_MINOR	36
+#define DM_VERSION_MINOR	45
 #define DM_VERSION_PATCHLEVEL	0
-#define DM_VERSION_EXTRA	"-ioctl (2017-06-09)"
+#define DM_VERSION_EXTRA	"-ioctl (2021-03-22)"
 
 /* Status bits */
 #define DM_READONLY_FLAG	(1 << 0) /* In/Out */
@@ -362,5 +376,11 @@ enum {
  * If set, the device is suspended internally.
  */
 #define DM_INTERNAL_SUSPEND_FLAG	(1 << 18) /* Out */
+
+/*
+ * If set, returns in the in buffer passed by UM, the raw table information
+ * that would be measured by IMA subsystem on device state change.
+ */
+#define DM_IMA_MEASUREMENT_FLAG	(1 << 19) /* In */
 
 #endif				/* _LINUX_DM_IOCTL_H */

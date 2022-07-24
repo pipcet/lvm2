@@ -42,6 +42,7 @@ struct text_fid_context {
 	char *write_buf;         /* buffer containing metadata text to write to disk */
 	uint32_t write_buf_size; /* mem size of write_buf, increases in 64K multiples */
 	uint32_t new_metadata_size; /* size of text metadata in buf */
+	uint32_t checksum;       /* crc32 checksum for new metadata */
 	unsigned preserve:1;
 };
 
@@ -296,84 +297,24 @@ static struct raw_locn *_read_metadata_location_vg(struct cmd_context *cmd,
 				       const char *vgname,
 				       int *precommitted)
 {
-	size_t len;
-	char vgnamebuf[NAME_LEN + 2] __attribute__((aligned(8)));
 	struct raw_locn *rlocn, *rlocn_precommitted;
-	struct lvmcache_info *info;
-	struct lvmcache_vgsummary vgsummary_orphan = {
-		.vgname = FMT_TEXT_ORPHAN_VG_NAME,
-	};
-	int rlocn_was_ignored;
-
-	dm_list_init(&vgsummary_orphan.pvsummaries);
-
-	memcpy(&vgsummary_orphan.vgid, FMT_TEXT_ORPHAN_VG_NAME, sizeof(FMT_TEXT_ORPHAN_VG_NAME));
 
 	rlocn = mdah->raw_locns;	/* Slot 0 */
 	rlocn_precommitted = rlocn + 1;	/* Slot 1 */
-
-	rlocn_was_ignored = rlocn_is_ignored(rlocn);
 
 	/* Should we use precommitted metadata? */
 	if (*precommitted && rlocn_precommitted->size &&
 	    (rlocn_precommitted->offset != rlocn->offset)) {
 		rlocn = rlocn_precommitted;
-		log_debug_metadata("VG %s metadata check %s mda %llu slot1 offset %llu size %llu",
-				   vgname ?: "",
-				   dev_name(dev_area->dev),
-				   (unsigned long long)dev_area->start,
-				   (unsigned long long)rlocn->offset,
-				   (unsigned long long)rlocn->size);
 	} else {
 		*precommitted = 0;
-		log_debug_metadata("VG %s metadata check %s mda %llu slot0 offset %llu size %llu",
-				   vgname ?: "",
-				   dev_name(dev_area->dev),
-				   (unsigned long long)dev_area->start,
-				   (unsigned long long)rlocn->offset,
-				   (unsigned long long)rlocn->size);
 	}
 
 	/* Do not check non-existent metadata. */
 	if (!rlocn->offset && !rlocn->size)
 		return NULL;
 
-	/*
-	 * Don't try to check existing metadata
-	 * if given vgname is an empty string.
-	 */
-	if (!vgname || !*vgname)
-		return rlocn;
-
-	/*
-	 * If live rlocn has ignored flag, data will be out-of-date so skip further checks.
-	 */
-	if (rlocn_was_ignored)
-		return rlocn;
-
-	/*
-	 * Verify that the VG metadata pointed to by the rlocn
-	 * begins with a valid vgname.
-	 */
-	memset(vgnamebuf, 0, sizeof(vgnamebuf));
-
-	if (!dev_read_bytes(dev_area->dev, dev_area->start + rlocn->offset, NAME_LEN, vgnamebuf))
-		goto fail;
-
-	if (!strncmp(vgnamebuf, vgname, len = strlen(vgname)) &&
-	    (isspace(vgnamebuf[len]) || vgnamebuf[len] == '{'))
-		return rlocn;
- fail:
-	log_error("Metadata on %s at %llu has wrong VG name \"%s\" expected %s.",
-		  dev_name(dev_area->dev),
-		  (unsigned long long)(dev_area->start + rlocn->offset),
-		  vgnamebuf, vgname);
-
-	if ((info = lvmcache_info_from_pvid(dev_area->dev->pvid, dev_area->dev, 0)) &&
-	    !lvmcache_update_vgname_and_id(cmd, info, &vgsummary_orphan))
-		stack;
-
-	return NULL;
+	return rlocn;
 }
 
 /*
@@ -487,16 +428,23 @@ static struct volume_group *_vg_read_raw_area(struct cmd_context *cmd,
 				rlocn->checksum,
 				&when, &desc);
 
-	if (!vg) {
-		/* FIXME: detect and handle errors, and distinguish from the optimization
-		   that skips parsing the metadata which also returns NULL. */
+	if (!vg && !*use_previous_vg) {
+		log_warn("WARNING: Failed to read metadata text at %llu off %llu size %llu VG %s on %s",
+			 (unsigned long long)(area->start + rlocn->offset),
+			 (unsigned long long)rlocn->offset,
+			 (unsigned long long)rlocn->size,
+			 vgname,
+			 dev_name(area->dev));
+
+		return NULL;
 	}
 
-	log_debug_metadata("Found metadata on %s at %llu size %llu for VG %s",
-			   dev_name(area->dev),
+	log_debug_metadata("Found metadata text at %llu off %llu size %llu VG %s on %s",
 			   (unsigned long long)(area->start + rlocn->offset),
+			   (unsigned long long)rlocn->offset,
 			   (unsigned long long)rlocn->size,
-			   vgname);
+			   vgname,
+			   dev_name(area->dev));
 
 	if (vg && precommitted)
 		vg->status |= PRECOMMITTED;
@@ -516,6 +464,28 @@ static struct volume_group *_vg_read_raw(struct cmd_context *cmd,
 	struct volume_group *vg;
 
 	vg = _vg_read_raw_area(cmd, fid, vgname, &mdac->area, vg_fmtdata, use_previous_vg, 0, mda_is_primary(mda));
+
+	if (!vg && use_previous_vg && !*use_previous_vg) {
+		/*
+		 * This condition (corrupt metadata text) is often seen in the
+		 * label_scan()/_text_read() phase, where this code corresponds to
+		 * the lvmcache_save_bad_mda() in _text_read().  In this case we
+		 * have two mda structs to deal with, one in lvmcache from label scan,
+		 * and the mda copy on fid->metadata_areas_in_use.
+		 */
+		struct device *dev = mdac->area.dev;
+		struct lvmcache_info *info = lvmcache_info_from_pvid(dev->pvid, dev, 0);
+		log_warn("WARNING: reading %s mda%d failed to read metadata.", dev_name(dev), mda_is_primary(mda)?1:2);
+		log_warn("WARNING: repair VG metadata on %s with vgck --updatemetadata.", dev_name(dev));
+		if (info)
+			/* remove mda from lvmcache, saving it in info->bad_mdas for possible repair with updatemetadata */
+			lvmcache_del_save_bad_mda(info, mda->mda_num, BAD_MDA_TEXT);
+		else
+			log_warn("WARNING: No cache info for %s", dev_name(dev));
+
+		/* remove mda from fid */
+		fid_remove_mda(fid, mda, NULL, 0, 0);
+	}
 
 	return vg;
 }
@@ -595,6 +565,7 @@ static int _vg_write_raw(struct format_instance *fid, struct volume_group *vg,
 	uint64_t write2_start = 0, write2_last = 0, write2_size = 0;
 	uint32_t write1_over = 0, write2_over = 0;
 	uint32_t write_buf_size;
+	uint32_t checksum;
 	uint32_t extra_size;
 	uint32_t bad_fields = 0;
 	char *write_buf = NULL;
@@ -654,6 +625,7 @@ static int _vg_write_raw(struct format_instance *fid, struct volume_group *vg,
 		write_buf = fidtc->write_buf;
 		write_buf_size = fidtc->write_buf_size;
 		new_size = fidtc->new_metadata_size;
+		checksum = fidtc->checksum;
 	} else {
 		if (!vg->write_count++)
 			(void) dm_snprintf(desc, sizeof(desc), "Write from %s.", vg->cmd->cmd_line);
@@ -684,6 +656,8 @@ static int _vg_write_raw(struct format_instance *fid, struct volume_group *vg,
 		dm_config_destroy(cft);
 		if (!vg->vg_precommitted)
 			goto_out;
+
+		fidtc->checksum = checksum = calc_crc(INITIAL_CRC, (uint8_t *)write_buf, new_size);
 	}
 
 	log_debug_metadata("VG %s seqno %u metadata write to %s mda_start %llu mda_size %llu mda_last %llu",
@@ -1007,23 +981,13 @@ static int _vg_write_raw(struct format_instance *fid, struct volume_group *vg,
 
 	dev_unset_last_byte(mdac->area.dev);
 
-	rlocn_new->checksum = calc_crc(INITIAL_CRC,
-				       (uint8_t *)write_buf,
-				       (uint32_t)(new_size - new_wrap));
-	if (new_wrap)
-		rlocn_new->checksum = calc_crc(rlocn_new->checksum,
-					(uint8_t *)write_buf + new_size - new_wrap,
-					(uint32_t)new_wrap);
+	rlocn_new->checksum = checksum;
 
 	r = 1;
 
       out:
-	if (!r) {
-		free(fidtc->write_buf);
-		fidtc->write_buf = NULL;
-		fidtc->write_buf_size = 0;
-		fidtc->new_metadata_size = 0;
-	}
+	if (!r)
+		free_text_fidtc(vg);
 
 	return r;
 }
@@ -1140,61 +1104,22 @@ static int _vg_commit_raw_rlocn(struct format_instance *fid,
 
 	rlocn_set_ignored(rlocn_slot0, mda_is_ignored(mda));
 
-	if (mdac->rlocn.size) {
-		if (precommit) {
-			log_debug_metadata("VG %s metadata precommit seq %u on %s mda header at %llu %s",
-					   vg->name, vg->seqno, dev_name(mdac->area.dev),
-					   (unsigned long long)mdac->area.start,
-					   mda_is_ignored(mda) ? "(ignored)" : "(used)");
+	log_debug_metadata("VG %s metadata %scommit %sseq %u on %s mda header at %llu %s.",
+			   vg->name,
+			   (precommit) ? "pre" : "",
+			   (!mdac->rlocn.size) ? "empty ": "",
+			   vg->seqno, dev_name(mdac->area.dev),
+			   (unsigned long long)mdac->area.start,
+			   mda_is_ignored(mda) ? "(ignored)" : "(used)");
 
-			log_debug_metadata("VG %s metadata precommit slot0 offset %llu size %llu slot1 offset %llu size %llu",
-					   vg->name,
-					   (unsigned long long)mdab->raw_locns[0].offset,
-					   (unsigned long long)mdab->raw_locns[0].size,
-					   (unsigned long long)mdab->raw_locns[1].offset,
-					   (unsigned long long)mdab->raw_locns[1].size);
-
-		} else {
-			log_debug_metadata("VG %s metadata commit seq %u on %s mda header at %llu %s",
-					   vg->name, vg->seqno, dev_name(mdac->area.dev),
-					   (unsigned long long)mdac->area.start,
-					   mda_is_ignored(mda) ? "(ignored)" : "(used)");
-
-			log_debug_metadata("VG %s metadata commit slot0 offset %llu size %llu slot1 offset %llu size %llu",
-					   vg->name,
-					   (unsigned long long)mdab->raw_locns[0].offset,
-					   (unsigned long long)mdab->raw_locns[0].size,
-					   (unsigned long long)mdab->raw_locns[1].offset,
-					   (unsigned long long)mdab->raw_locns[1].size);
-		}
-	} else {
-		if (precommit) {
-			log_debug_metadata("VG %s metadata precommit empty seq %u on %s mda header at %llu %s",
-					   vg->name, vg->seqno, dev_name(mdac->area.dev),
-					   (unsigned long long)mdac->area.start,
-					   mda_is_ignored(mda) ? "(ignored)" : "(used)");
-
-			log_debug_metadata("VG %s metadata precommit empty slot0 offset %llu size %llu slot1 offset %llu size %llu",
-					   vg->name,
-					   (unsigned long long)mdab->raw_locns[0].offset,
-					   (unsigned long long)mdab->raw_locns[0].size,
-					   (unsigned long long)mdab->raw_locns[1].offset,
-					   (unsigned long long)mdab->raw_locns[1].size);
-
-		} else {
-			log_debug_metadata("VG %s metadata commit empty seq %u on %s mda header at %llu %s",
-					   vg->name, vg->seqno, dev_name(mdac->area.dev),
-					   (unsigned long long)mdac->area.start,
-					   mda_is_ignored(mda) ? "(ignored)" : "(used)");
-
-			log_debug_metadata("VG %s metadata commit empty slot0 offset %llu size %llu slot1 offset %llu size %llu",
-					   vg->name,
-					   (unsigned long long)mdab->raw_locns[0].offset,
-					   (unsigned long long)mdab->raw_locns[0].size,
-					   (unsigned long long)mdab->raw_locns[1].offset,
-					   (unsigned long long)mdab->raw_locns[1].size);
-		}
-	}
+	log_debug_metadata("VG %s metadata %scommit %sslot0 offset %llu size %llu slot1 offset %llu size %llu.",
+			   vg->name,
+			   (precommit) ? "pre" : "",
+			   (!mdac->rlocn.size) ? "empty ": "",
+			   (unsigned long long)mdab->raw_locns[0].offset,
+			   (unsigned long long)mdab->raw_locns[0].size,
+			   (unsigned long long)mdab->raw_locns[1].offset,
+			   (unsigned long long)mdab->raw_locns[1].size);
 
 	rlocn_set_ignored(mdab->raw_locns, mda_is_ignored(mda));
 
@@ -1208,12 +1133,8 @@ static int _vg_commit_raw_rlocn(struct format_instance *fid,
 	r = 1;
 
       out:
-	if (!precommit && !fidtc->preserve) {
-		free(fidtc->write_buf);
-		fidtc->write_buf = NULL;
-		fidtc->write_buf_size = 0;
-		fidtc->new_metadata_size = 0;
-	}
+	if (!precommit && !fidtc->preserve)
+		free_text_fidtc(vg);
 
 	return r;
 }
@@ -1533,8 +1454,6 @@ int read_metadata_location_summary(const struct format_type *fmt,
 {
 	struct raw_locn *rlocn;
 	uint32_t wrap = 0;
-	unsigned int len = 0;
-	char namebuf[NAME_LEN + 1] __attribute__((aligned(8)));
 	uint64_t max_size;
 
 	if (!mdah) {
@@ -1560,28 +1479,6 @@ int read_metadata_location_summary(const struct format_type *fmt,
 				   dev_name(dev_area->dev),
 				   (unsigned long long)(dev_area->start + rlocn->offset));
 		vgsummary->zero_offset = 1;
-		return 0;
-	}
-
-	memset(namebuf, 0, sizeof(namebuf));
-
-	if (!dev_read_bytes(dev_area->dev, dev_area->start + rlocn->offset, NAME_LEN, namebuf))
-		stack;
-
-	while (namebuf[len] && !isspace(namebuf[len]) && namebuf[len] != '{' &&
-	       len < (NAME_LEN - 1))
-		len++;
-
-	namebuf[len] = '\0';
-
-	/*
-	 * Check that the text metadata in the circular buffer begins with a
-	 * valid vg name.
-	 */
-	if (!validate_name(namebuf)) {
-		log_warn("WARNING: Metadata location on %s at %llu begins with invalid VG name.",
-			  dev_name(dev_area->dev),
-			  (unsigned long long)(dev_area->start + rlocn->offset));
 		return 0;
 	}
 
@@ -1648,7 +1545,11 @@ int read_metadata_location_summary(const struct format_type *fmt,
 	/* Keep track of largest metadata size we find. */
 	lvmcache_save_metadata_size(rlocn->size);
 
-	lvmcache_lookup_mda(vgsummary);
+	if (lvmcache_lookup_mda(vgsummary)) {
+		log_debug("Skipping read of already known VG metadata with matching mda checksum on %s.",
+			  dev_name(dev_area->dev));
+		goto out;
+	}
 
 	if (!text_read_metadata_summary(fmt, dev_area->dev, MDA_CONTENT_REASON(primary_mda),
 				(off_t) (dev_area->start + rlocn->offset),
@@ -1669,7 +1570,7 @@ int read_metadata_location_summary(const struct format_type *fmt,
 			  (unsigned long long)(dev_area->start + rlocn->offset));
 		return 0;
 	}
-
+out:
 	log_debug_metadata("Found metadata summary on %s at %llu size %llu for VG %s",
 			   dev_name(dev_area->dev),
 			   (unsigned long long)(dev_area->start + rlocn->offset),
@@ -1735,8 +1636,9 @@ static int _set_ext_flags(struct physical_volume *pv, struct lvmcache_info *info
 /* Only for orphans - FIXME That's not true any more */
 static int _text_pv_write(struct cmd_context *cmd, const struct format_type *fmt, struct physical_volume *pv)
 {
+	char pvid[ID_LEN + 1] __attribute__((aligned(8))) = { 0 };
+	char vgid[ID_LEN + 1] __attribute__((aligned(8))) = { 0 };
 	struct format_instance *fid = pv->fid;
-	const char *pvid = (const char *) (*pv->old_id.uuid ? &pv->old_id : &pv->id);
 	struct label *label;
 	struct lvmcache_info *info;
 	struct mda_context *mdac;
@@ -1744,10 +1646,18 @@ static int _text_pv_write(struct cmd_context *cmd, const struct format_type *fmt
 	struct _write_single_mda_baton baton;
 	unsigned mda_index;
 
+	if (is_orphan_vg(pv->vg_name))
+		memcpy(vgid, pv->vg_name, ID_LEN);
+	else if (pv->vg)
+		memcpy(vgid, &pv->vg->id.uuid, ID_LEN);
+
+	memcpy(pvid, &pv->id.uuid, ID_LEN);
+
 	/* Add a new cache entry with PV info or update existing one. */
-	if (!(info = lvmcache_add(cmd, fmt->labeller, (const char *) &pv->id,
+	if (!(info = lvmcache_add(cmd, fmt->labeller, pvid,
 				  pv->dev,  pv->label_sector, pv->vg_name,
-				  is_orphan_vg(pv->vg_name) ? pv->vg_name : pv->vg ? (const char *) &pv->vg->id : NULL, 0, NULL)))
+				  vgid[0] ? vgid : NULL,
+				  0, NULL)))
 		return_0;
 
 	/* lvmcache_add() creates info and info->label structs for the dev, get info->label. */
@@ -1765,6 +1675,13 @@ static int _text_pv_write(struct cmd_context *cmd, const struct format_type *fmt
 	 * The fid_get_mda_indexed fn can handle that transparently,
 	 * just pass the right format_instance in.
 	 */
+
+	/* FIXME: why is old needed here? */
+	if (*pv->old_id.uuid)
+		memcpy(pvid, &pv->old_id.uuid, ID_LEN);
+	else
+		memcpy(pvid, &pv->id.uuid, ID_LEN);
+
 	for (mda_index = 0; mda_index < FMT_TEXT_MAX_MDAS_PER_PV; mda_index++) {
 		if (!(mda = fid_get_mda_indexed(fid, pvid, ID_LEN, mda_index)))
 			continue;
@@ -1843,7 +1760,7 @@ static int _text_pv_needs_rewrite(const struct format_type *fmt, struct physical
 	if (!pv->dev)
 		return 1;
 
-	if (!(info = lvmcache_info_from_pvid((const char *)&pv->id, pv->dev, 0))) {
+	if (!(info = lvmcache_info_from_pv_id(&pv->id, pv->dev, 0))) {
 		log_error("Failed to find cached info for PV %s.", pv_dev_name(pv));
 		return 0;
 	}
@@ -2009,7 +1926,9 @@ static int _text_pv_initialise(const struct format_type *fmt,
 		pv->pe_count = pva->extent_count;
 
 	if ((pv->pe_start + pv->pe_count * (uint64_t)pv->pe_size - 1) > pv->size) {
-		log_error("Physical extents end beyond end of device %s.",
+		log_error("Physical extents (%s) end beyond end of device (%s) %s.",
+			  display_size(pv->fmt->cmd, pv->pe_start + pv->pe_count * (uint64_t)pv->pe_size - 1),
+			  display_size(pv->fmt->cmd, pv->size),
 			  pv_dev_name(pv));
 		return 0;
 	}
@@ -2075,14 +1994,20 @@ static int _text_pv_setup(const struct format_type *fmt,
 			  struct physical_volume *pv,
 			  struct volume_group *vg)
 {
+	char pvid[ID_LEN + 1] __attribute__((aligned(8)));
 	struct format_instance *fid = pv->fid;
-	const char *pvid = (const char *) (*pv->old_id.uuid ? &pv->old_id : &pv->id);
 	struct lvmcache_info *info;
 	unsigned mda_index;
 	struct metadata_area *pv_mda, *pv_mda_copy;
 	struct mda_context *pv_mdac;
 	uint64_t pe_count;
 	uint64_t size_reduction = 0;
+
+	pvid[ID_LEN] = 0;
+	if (*pv->old_id.uuid)
+		memcpy(pvid, &pv->old_id.uuid, ID_LEN);
+	else
+		memcpy(pvid, &pv->id.uuid, ID_LEN);
 
 	/* If PV has its own format instance, add mdas from pv->fid to vg->fid. */
 	if (pv->fid != vg->fid) {
@@ -2249,6 +2174,7 @@ static int _add_metadata_area_to_pv(struct physical_volume *pv,
 				    uint64_t mda_size,
 				    unsigned mda_ignored)
 {
+	char pvid[ID_LEN + 1] __attribute__((aligned(8)));
 	struct metadata_area *mda;
 	struct mda_context *mdac;
 	struct mda_lists *mda_lists = (struct mda_lists *) pv->fmt->private;
@@ -2283,7 +2209,10 @@ static int _add_metadata_area_to_pv(struct physical_volume *pv,
 	memset(&mdac->rlocn, 0, sizeof(mdac->rlocn));
 	mda_set_ignored(mda, mda_ignored);
 
-	fid_add_mda(pv->fid, mda, (char *) &pv->id, ID_LEN, mda_index);
+	pvid[ID_LEN] = 0;
+	memcpy(pvid, &pv->id.uuid, ID_LEN);
+
+	fid_add_mda(pv->fid, mda, pvid, ID_LEN, mda_index);
 
 	return 1;
 }
@@ -2299,8 +2228,8 @@ static int _text_pv_add_metadata_area(const struct format_type *fmt,
 				      uint64_t mda_size,
 				      unsigned mda_ignored)
 {
+	char pvid[ID_LEN + 1] __attribute__((aligned(8))) = { 0 };
 	struct format_instance *fid = pv->fid;
-	const char *pvid = (const char *) (*pv->old_id.uuid ? &pv->old_id : &pv->id);
 	uint64_t ba_size, pe_start, first_unallocated;
 	uint64_t alignment, alignment_offset;
 	uint64_t disk_size;
@@ -2313,6 +2242,11 @@ static int _text_pv_add_metadata_area(const struct format_type *fmt,
 	struct mda_context *mdac;
 	const char *limit_name;
 	int limit_applied = 0;
+
+	if (*pv->old_id.uuid)
+		memcpy(pvid, &pv->old_id.uuid, ID_LEN);
+	else
+		memcpy(pvid, &pv->id.uuid, ID_LEN);
 
 	if (mda_index >= FMT_TEXT_MAX_MDAS_PER_PV) {
 		log_error(INTERNAL_ERROR "invalid index of value %u used "
@@ -2543,6 +2477,8 @@ bad:
 static int _remove_metadata_area_from_pv(struct physical_volume *pv,
 					 unsigned mda_index)
 {
+	char pvid[ID_LEN + 1] __attribute__((aligned(8))) = { 0 };
+
 	if (mda_index >= FMT_TEXT_MAX_MDAS_PER_PV) {
 		log_error(INTERNAL_ERROR "can't remove metadata area with "
 					 "index %u from PV %s. Metadata "
@@ -2552,8 +2488,9 @@ static int _remove_metadata_area_from_pv(struct physical_volume *pv,
 		return 0;
 	}
 
-	return fid_remove_mda(pv->fid, NULL, (const char *) &pv->id,
-			      ID_LEN, mda_index);
+	memcpy(pvid, &pv->id.uuid, ID_LEN);
+
+	return fid_remove_mda(pv->fid, NULL, pvid, ID_LEN, mda_index);
 }
 
 static int _text_pv_remove_metadata_area(const struct format_type *fmt,
@@ -2568,13 +2505,18 @@ static int _text_pv_resize(const struct format_type *fmt,
 			   struct volume_group *vg,
 			   uint64_t size)
 {
+	char pvid[ID_LEN + 1] __attribute__((aligned(8))) = { 0 };
 	struct format_instance *fid = pv->fid;
-	const char *pvid = (const char *) (*pv->old_id.uuid ? &pv->old_id : &pv->id);
 	struct metadata_area *mda;
 	struct mda_context *mdac;
 	uint64_t size_reduction;
 	uint64_t mda_size;
 	unsigned mda_ignored;
+
+	if (*pv->old_id.uuid)
+		memcpy(pvid, &pv->old_id.uuid, ID_LEN);
+	else
+		memcpy(pvid, &pv->id.uuid, ID_LEN);
 
 	/*
 	 * First, set the new size and update the cache and reset pe_count.
@@ -2659,7 +2601,7 @@ struct format_type *create_text_format(struct cmd_context *cmd)
 	fmt->ops = &_text_handler;
 	fmt->name = FMT_TEXT_NAME;
 	fmt->alias = FMT_TEXT_ALIAS;
-	fmt->orphan_vg_name = ORPHAN_VG_NAME(FMT_TEXT_NAME);
+	strncpy(fmt->orphan_vg_name, ORPHAN_VG_NAME(FMT_TEXT_NAME), sizeof(fmt->orphan_vg_name));
 	fmt->features = FMT_SEGMENTS | FMT_TAGS | FMT_PRECOMMIT |
 			FMT_UNLIMITED_VOLS | FMT_RESIZE_PV |
 			FMT_UNLIMITED_STRIPESIZE | FMT_CONFIG_PROFILE |
@@ -2741,4 +2683,3 @@ int text_wipe_outdated_pv_mda(struct cmd_context *cmd, struct device *dev,
 
 	return 1;
 }
-

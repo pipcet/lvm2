@@ -69,15 +69,18 @@ bool dm_vdo_status_parse(struct dm_pool *mem, const char *input,
 enum dm_vdo_write_policy {
 	DM_VDO_WRITE_POLICY_AUTO = 0,
 	DM_VDO_WRITE_POLICY_SYNC,
-	DM_VDO_WRITE_POLICY_ASYNC
+	DM_VDO_WRITE_POLICY_ASYNC,
+	DM_VDO_WRITE_POLICY_ASYNC_UNSAFE
 };
 
 // FIXME: review whether we should use the createParams from the userlib
 struct dm_vdo_target_params {
 	uint32_t minimum_io_size;       // in sectors
 	uint32_t block_map_cache_size_mb;
-	uint32_t block_map_era_length;	// format period
-
+	union {
+		uint32_t block_map_era_length;	// format period
+		uint32_t block_map_period;      // supported alias
+	};
 	uint32_t check_point_frequency;
 	uint32_t index_memory_size_mb;  // format
 

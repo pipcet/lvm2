@@ -159,6 +159,14 @@ _run_test() {
 aux prepare_scsi_debug_dev 256 sector_size=512 physblk_exp=3
 aux prepare_devs 2 64
 
+# Tests with fs block sizes require a libblkid version that shows BLOCK_SIZE
+vgcreate $vg "$dev1"
+lvcreate -n $lv1 -L50 $vg
+mkfs.xfs -f "$DM_DEV_DIR/$vg/$lv1"
+blkid -c /dev/null "$DM_DEV_DIR/$vg/$lv1" | grep BLOCK_SIZE || skip
+lvchange -an $vg
+vgremove -ff $vg
+
 # loopa/loopb have LBS 512 PBS 512
 which fallocate || skip
 fallocate -l 64M loopa
@@ -193,6 +201,7 @@ blockdev --getpbsz "$LOOP1" | grep 512
 blockdev --getpbsz "$LOOP2" | grep 512
 
 aux extend_filter "a|$dev3|" "a|$dev4|"
+aux extend_devices "$dev3" "$dev4"
 
 # place main LV on dev1 with LBS 512, PBS 4096
 # and the cache on dev3 with LBS 512, PBS 512

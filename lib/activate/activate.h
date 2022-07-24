@@ -106,6 +106,10 @@ int target_present(struct cmd_context *cmd, const char *target_name,
 		   int use_modprobe);
 int target_version(const char *target_name, uint32_t *maj,
 		   uint32_t *min, uint32_t *patchlevel);
+
+int get_device_list(const struct volume_group *vg, struct dm_list **devs,
+		    unsigned *devs_features);
+
 int raid4_is_supported(struct cmd_context *cmd, const struct segment_type *segtype);
 int lvm_dm_prefix_check(int major, int minor, const char *prefix);
 int list_segment_modules(struct dm_pool *mem, const struct lv_segment *seg,
@@ -254,7 +258,7 @@ struct dev_usable_check_params {
  * Returns 1 if mapped device is not suspended, blocked or
  * is using a reserved name.
  */
-int device_is_usable(struct device *dev, struct dev_usable_check_params check, int *is_lv);
+int device_is_usable(struct cmd_context *cmd, struct device *dev, struct dev_usable_check_params check, int *is_lv);
 
 /*
  * Declaration moved here from fs.h to keep header fs.h hidden

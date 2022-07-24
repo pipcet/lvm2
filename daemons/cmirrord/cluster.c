@@ -108,7 +108,7 @@ static SaVersionT version = { 'B', 1, 1 };
 #endif
 
 #define DEBUGGING_HISTORY 100
-#define DEBUGGING_BUFLEN 128
+#define DEBUGGING_BUFLEN 270
 #define LOG_SPRINT(cc, f, arg...) do {				\
 		cc->idx++;					\
 		cc->idx = cc->idx % DEBUGGING_HISTORY;		\
@@ -1383,7 +1383,7 @@ static void cpg_leave_callback(struct clog_cpg *match,
 			       size_t member_list_entries)
 {
 	unsigned i;
-	int j, fd;
+	int j, fd = -1;
 	uint32_t lowest = match->lowest_id;
 	struct clog_request *rq, *n;
 	struct checkpoint_data *p_cp, *c_cp;

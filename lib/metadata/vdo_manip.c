@@ -81,6 +81,8 @@ const char *get_vdo_write_policy_name(enum dm_vdo_write_policy policy)
 		return "sync";
 	case DM_VDO_WRITE_POLICY_ASYNC:
 		return "async";
+	case DM_VDO_WRITE_POLICY_ASYNC_UNSAFE:
+		return "async-unsafe";
 	default:
 		log_debug(INTERNAL_ERROR "Unrecognized VDO write policy: %u.", policy);
 		/* Fall through */
@@ -123,48 +125,56 @@ int update_vdo_pool_virtual_size(struct lv_segment *vdo_pool_seg)
 	return 1;
 }
 
-static int _sysfs_get_kvdo_value(const char *dm_name, const char *vdo_param, uint64_t *value)
+static int _sysfs_get_kvdo_value(const char *dm_name, const struct dm_info *dminfo,
+				 const char *vdo_param, uint64_t *value)
 {
 	char path[PATH_MAX];
 	char temp[64];
 	int fd, size, r = 0;
 
-	if (dm_snprintf(path, sizeof(path), "%skvdo/%s/%s",
-			dm_sysfs_dir(), dm_name, vdo_param) < 0) {
-		log_error("Failed to build kmod path.");
+	if (dm_snprintf(path, sizeof(path), "%s/block/dm-%d/vdo/%s",
+			dm_sysfs_dir(), dminfo->minor, vdo_param) < 0) {
+		log_debug("Failed to build kvdo path.");
 		return 0;
 	}
 
 	if ((fd = open(path, O_RDONLY)) < 0) {
-		if (errno != ENOENT)
-			log_sys_error("open", path);
-		else
+		/* try with older location */
+		if (dm_snprintf(path, sizeof(path), "%skvdo/%s/%s",
+				dm_sysfs_dir(), dm_name, vdo_param) < 0) {
+			log_debug("Failed to build kvdo path.");
+			return 0;
+		}
+
+		if ((fd = open(path, O_RDONLY)) < 0) {
 			log_sys_debug("open", path);
-		goto bad;
+			goto bad;
+		}
 	}
 
 	if ((size = read(fd, temp, sizeof(temp) - 1)) < 0) {
-		log_sys_error("read", path);
+		log_sys_debug("read", path);
 		goto bad;
 	}
 	temp[size] = 0;
 	errno = 0;
 	*value = strtoll(temp, NULL, 0);
 	if (errno) {
-		log_sys_error("strtool", path);
+		log_sys_debug("strtool", path);
 		goto bad;
 	}
 
 	r = 1;
 bad:
 	if (fd >= 0 && close(fd))
-		log_sys_error("close", path);
+		log_sys_debug("close", path);
 
 	return r;
 }
 
 int parse_vdo_pool_status(struct dm_pool *mem, const struct logical_volume *vdo_pool_lv,
-			  const char *params, struct lv_status_vdo *status)
+			  const char *params, const struct dm_info *dminfo,
+			  struct lv_status_vdo *status)
 {
 	struct dm_vdo_status_parse_result result;
 	char *dm_name;
@@ -188,15 +198,11 @@ int parse_vdo_pool_status(struct dm_pool *mem, const struct logical_volume *vdo_
 
 	status->vdo = result.status;
 
-	if (result.status->operating_mode == DM_VDO_MODE_NORMAL) {
-		if (!_sysfs_get_kvdo_value(dm_name, "statistics/data_blocks_used",
-					   &status->data_blocks_used))
-			return_0;
-
-		if (!_sysfs_get_kvdo_value(dm_name, "statistics/logical_blocks_used",
-					   &status->logical_blocks_used))
-			return_0;
-
+	if ((result.status->operating_mode == DM_VDO_MODE_NORMAL) &&
+	    _sysfs_get_kvdo_value(dm_name, dminfo, "statistics/data_blocks_used",
+				  &status->data_blocks_used) &&
+	    _sysfs_get_kvdo_value(dm_name, dminfo, "statistics/logical_blocks_used",
+				  &status->logical_blocks_used)) {
 		status->usage = dm_make_percent(result.status->used_blocks,
 						result.status->total_blocks);
 		status->saving = dm_make_percent(status->logical_blocks_used - status->data_blocks_used,
@@ -356,9 +362,9 @@ static int _format_vdo_pool_data_lv(struct logical_volume *data_lv,
 struct logical_volume *convert_vdo_pool_lv(struct logical_volume *data_lv,
 					   const struct dm_vdo_target_params *vtp,
 					   uint32_t *virtual_extents,
-					   int format)
+					   int format,
+					   uint64_t vdo_pool_header_size)
 {
-	const uint64_t header_size = DEFAULT_VDO_POOL_HEADER_SIZE;
 	const uint32_t extent_size = data_lv->vg->extent_size;
 	struct cmd_context *cmd = data_lv->vg->cmd;
 	struct logical_volume *vdo_pool_lv = data_lv;
@@ -379,7 +385,7 @@ struct logical_volume *convert_vdo_pool_lv(struct logical_volume *data_lv,
 
 	if (*virtual_extents)
 		vdo_logical_size =
-			_get_virtual_size(*virtual_extents, extent_size, header_size);
+			_get_virtual_size(*virtual_extents, extent_size, vdo_pool_header_size);
 
 	if (!dm_vdo_validate_target_params(vtp, vdo_logical_size))
 		return_0;
@@ -393,7 +399,8 @@ struct logical_volume *convert_vdo_pool_lv(struct logical_volume *data_lv,
 	} else {
 		log_verbose("Skiping VDO formating %s.", display_lvname(data_lv));
 		/* TODO: parse existing VDO data and retrieve vdo_logical_size */
-		vdo_logical_size = data_lv->size;
+		if (!*virtual_extents)
+			vdo_logical_size = data_lv->size;
 	}
 
 	if (!deactivate_lv(data_lv->vg->cmd, data_lv)) {
@@ -402,7 +409,7 @@ struct logical_volume *convert_vdo_pool_lv(struct logical_volume *data_lv,
 		return NULL;
 	}
 
-	vdo_logical_size -= 2 * header_size;
+	vdo_logical_size -= 2 * vdo_pool_header_size;
 
 	if (vdo_logical_size < extent_size) {
 		if (!*virtual_extents)
@@ -425,7 +432,7 @@ struct logical_volume *convert_vdo_pool_lv(struct logical_volume *data_lv,
 	vdo_pool_seg = first_seg(vdo_pool_lv);
 	vdo_pool_seg->segtype = vdo_pool_segtype;
 	vdo_pool_seg->vdo_params = *vtp;
-	vdo_pool_seg->vdo_pool_header_size = DEFAULT_VDO_POOL_HEADER_SIZE;
+	vdo_pool_seg->vdo_pool_header_size = vdo_pool_header_size;
 	vdo_pool_seg->vdo_pool_virtual_extents = *virtual_extents;
 
 	vdo_pool_lv->status |= LV_VDO_POOL;
@@ -440,6 +447,8 @@ int set_vdo_write_policy(enum dm_vdo_write_policy *vwp, const char *policy)
 		*vwp = DM_VDO_WRITE_POLICY_SYNC;
 	else if (strcasecmp(policy, "async") == 0)
 		*vwp = DM_VDO_WRITE_POLICY_ASYNC;
+	else if (strcasecmp(policy, "async-unsafe") == 0)
+		*vwp = DM_VDO_WRITE_POLICY_ASYNC_UNSAFE;
 	else if (strcasecmp(policy, "auto") == 0)
 		*vwp = DM_VDO_WRITE_POLICY_AUTO;
 	else {
@@ -452,6 +461,7 @@ int set_vdo_write_policy(enum dm_vdo_write_policy *vwp, const char *policy)
 
 int fill_vdo_target_params(struct cmd_context *cmd,
 			   struct dm_vdo_target_params *vtp,
+			   uint64_t *vdo_pool_header_size,
 			   struct profile *profile)
 {
 	const char *policy;
@@ -499,6 +509,8 @@ int fill_vdo_target_params(struct cmd_context *cmd,
 	policy = find_config_tree_str(cmd, allocation_vdo_write_policy_CFG, profile);
 	if (!set_vdo_write_policy(&vtp->write_policy, policy))
 		return_0;
+
+	*vdo_pool_header_size = 2 * find_config_tree_int64(cmd, allocation_vdo_pool_header_size_CFG, profile);
 
 	return 1;
 }

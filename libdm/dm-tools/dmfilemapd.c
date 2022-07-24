@@ -629,7 +629,7 @@ check_unlinked:
 static int _daemonise(struct filemap_monitor *fm)
 {
 	pid_t pid = 0;
-	int fd;
+	int fd, ffd;
 
 	if (!setsid()) {
 		_early_log("setsid failed.");
@@ -664,18 +664,18 @@ static int _daemonise(struct filemap_monitor *fm)
 			if (fd > STDERR_FILENO)
 				(void) close(fd);
 			_early_log("Error redirecting stdin/out/err to null.");
+			/* coverity[leaked_handle] no leak */
 			return 0;
 		}
 		if (fd > STDERR_FILENO)
 			(void) close(fd);
 	}
 	/* TODO: Use libdaemon/server/daemon-server.c _daemonise() */
-	for (fd = (int) sysconf(_SC_OPEN_MAX) - 1; fd > STDERR_FILENO; fd--) {
-		if (fd == fm->fd)
-			continue;
-		(void) close(fd);
-	}
+	for (ffd = (int) sysconf(_SC_OPEN_MAX) - 1; ffd > STDERR_FILENO; --ffd)
+		if (ffd != fm->fd)
+			(void) close(ffd);
 
+	/* coverity[leaked_handle] no leak */
 	return 1;
 }
 

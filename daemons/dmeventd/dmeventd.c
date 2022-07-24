@@ -678,6 +678,9 @@ static int _get_status(struct message_data *message_data)
 	char **buffers;
 	char *message;
 
+	if (!message_data->id)
+		return -EINVAL;
+
 	_lock_mutex();
 	count = dm_list_size(&_thread_registry);
 	buffers = alloca(sizeof(char*) * count);
@@ -1072,6 +1075,7 @@ out:
 	 * "label at end of compound statement" */
 	;
 
+	/* coverity[lock_order] _global_mutex is kept locked */
 	pthread_cleanup_pop(1);
 
 	return NULL;
@@ -2069,7 +2073,7 @@ static void _restart_dmeventd(void)
 			++count;
 		}
 
-	if (!(_initial_registrations = malloc(sizeof(char*) * (count + 1)))) {
+	if (!(_initial_registrations = zalloc(sizeof(char*) * (count + 1)))) {
 		fprintf(stderr, "Memory allocation registration failed.\n");
 		goto bad;
 	}
@@ -2081,7 +2085,6 @@ static void _restart_dmeventd(void)
 		}
 		message += strlen(message) + 1;
 	}
-	_initial_registrations[count] = NULL;
 
 	if (version >= 2) {
 		if (daemon_talk(&fifos, &msg, DM_EVENT_CMD_GET_PARAMETERS, "-", "-", 0, 0)) {

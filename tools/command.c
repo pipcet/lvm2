@@ -141,7 +141,8 @@ static inline int dumptype_arg(struct cmd_context *cmd __attribute__((unused)), 
 #define CAN_USE_ONE_SCAN	 0x00002000
 #define ALLOW_HINTS              0x00004000
 #define ALLOW_EXPORTED           0x00008000
-
+#define CHECK_DEVS_USED          0x00010000
+#define DEVICE_ID_NOT_FOUND      0x00020000
 
 /* create foo_CMD enums for command def ID's in command-lines.in */
 
@@ -756,6 +757,9 @@ static void _set_opt_def(struct cmd_context *cmdtool, struct command *cmd, char 
 			def->num = (uint64_t)atoi(name);
 
 		if (val_enum == conststr_VAL) {
+#ifdef MAN_PAGE_GENERATOR
+			free((void*)def->str);
+#endif
 			def->str = dm_pool_strdup(cmdtool->libmem, name);
 
 			if (!def->str) {
@@ -1538,20 +1542,27 @@ int define_commands(struct cmd_context *cmdtool, const char *run_name)
 		 */
 
 		if (_is_desc_line(line_argv[0]) && !skip && cmd) {
-			char *desc = dm_pool_strdup(cmdtool->libmem, line_orig);
-			if (cmd->desc && desc) {
-				int newlen = strlen(cmd->desc) + strlen(desc) + 2;
+			if (cmd->desc) {
+				size_t newlen = strlen(cmd->desc) + strlen(line_orig) + 2;
 				char *newdesc = dm_pool_alloc(cmdtool->libmem, newlen);
-				if (newdesc) {
-					snprintf(newdesc, newlen, "%s %s", cmd->desc, desc);
-					cmd->desc = newdesc;
-				} else {
+
+				if (!newdesc) {
 					/* FIXME */
 					stack;
 					return 0;
 				}
-			} else
-				cmd->desc = desc;
+
+				snprintf(newdesc, newlen, "%s %s", cmd->desc, line_orig);
+#ifdef MAN_PAGE_GENERATOR
+				free((void*)cmd->desc);
+#endif
+				cmd->desc = newdesc;
+			} else if (!(cmd->desc = dm_pool_strdup(cmdtool->libmem, line_orig))) {
+				/* FIXME */
+				stack;
+				return 0;
+			}
+
 			continue;
 		}
 
@@ -1571,6 +1582,9 @@ int define_commands(struct cmd_context *cmdtool, const char *run_name)
 		}
 
 		if (_is_id_line(line_argv[0]) && cmd) {
+#ifdef MAN_PAGE_GENERATOR
+			free((void*)cmd->command_id);
+#endif
 			cmd->command_id = dm_pool_strdup(cmdtool->libmem, line_argv[1]);
 
 			if (!cmd->command_id) {
@@ -2535,7 +2549,7 @@ static const char *_man_long_opt_name(const char *cmdname, int opt_enum)
 	}
 
 	if (strchr(long_opt, '[')) {
-		for (i = 0; i < sizeof(long_opt_name) - 1; ++long_opt, ++i) {
+		for (i = 0; *long_opt && i < sizeof(long_opt_name) - 1; ++long_opt, ++i) {
 			if (i < (sizeof(long_opt_name) - 8))
 				switch(*long_opt) {
 				case '[':
@@ -3525,7 +3539,7 @@ static int _include_description_file(char *name, char *des_file)
 	char *buf;
 	int fd, r = 0;
 	ssize_t sz;
-	struct stat statbuf;
+	struct stat statbuf = { 0 };
 
 	if ((fd = open(des_file, O_RDONLY)) < 0) {
 		log_error("Failed to open description file %s.", des_file);
@@ -3673,8 +3687,6 @@ static int _print_man(char *name, char *des_file, int secondary)
 				printf(".P\n");
 			}
 		}
-
-		continue;
 	}
 
 	return 1;
@@ -4003,9 +4015,9 @@ int main(int argc, char *argv[])
 
 	factor_common_options();
 
-	if (primary)
+	if (primary && cmdname)
 		r = _print_man(cmdname, desfile, secondary);
-	else if (secondary) {
+	else if (secondary && cmdname) {
 		r = 1;
 		_print_man_secondary(cmdname);
 	} else if (check) {

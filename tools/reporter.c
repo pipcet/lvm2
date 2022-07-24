@@ -828,7 +828,7 @@ static int _get_report_options(struct cmd_context *cmd,
 {
 	int action;
 	struct arg_value_group_list *current_group;
-	struct dm_list *final_opts_list[REPORT_IDX_COUNT];
+	struct dm_list *final_opts_list[REPORT_IDX_COUNT] = { NULL };
 	struct dm_list *opts_list = NULL;
 	struct dm_str_list *sl;
 	struct dm_pool *mem;
@@ -1203,7 +1203,7 @@ static int _full_report_single(struct cmd_context *cmd,
 	int orphan = is_orphan_vg(vg->name);
 	int r = ECMD_FAILED;
 
-	if (orphan && !dm_list_size(&vg->pvs))
+	if (orphan && dm_list_empty(&vg->pvs))
 		return ECMD_PROCESSED;
 
 	args->full_report_vg = vg;

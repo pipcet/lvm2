@@ -48,13 +48,14 @@ int dev_cache_exit(void);
  */
 int dev_cache_check_for_open_devices(void);
 
-void dev_cache_scan(void);
+void dev_cache_scan(struct cmd_context *cmd);
 int dev_cache_has_scanned(void);
 
 int dev_cache_add_dir(const char *path);
 struct device *dev_cache_get(struct cmd_context *cmd, const char *name, struct dev_filter *f);
-
-struct device *dev_cache_get_by_devt(struct cmd_context *cmd, dev_t device, struct dev_filter *f, int *filtered);
+struct device *dev_cache_get_existing(struct cmd_context *cmd, const char *name, struct dev_filter *f);
+struct device *dev_cache_get_by_devt(struct cmd_context *cmd, dev_t devt);
+void dev_cache_verify_aliases(struct device *dev);
 
 struct device *dev_hash_get(const char *name);
 
@@ -68,16 +69,20 @@ struct dev_iter *dev_iter_create(struct dev_filter *f, int unused);
 void dev_iter_destroy(struct dev_iter *iter);
 struct device *dev_iter_get(struct cmd_context *cmd, struct dev_iter *iter);
 
-void dev_reset_error_count(struct cmd_context *cmd);
-
 void dev_cache_failed_path(struct device *dev, const char *path);
 
 bool dev_cache_has_md_with_end_superblock(struct dev_types *dt);
 
 int get_sysfs_value(const char *path, char *buf, size_t buf_size, int error_if_no_value);
+int get_dm_uuid_from_sysfs(char *buf, size_t buf_size, int major, int minor);
 
 int setup_devices_file(struct cmd_context *cmd);
 int setup_devices(struct cmd_context *cmd);
 int setup_device(struct cmd_context *cmd, const char *devname);
+
+int setup_devices_for_online_autoactivation(struct cmd_context *cmd);
+int setup_devname_in_dev_cache(struct cmd_context *cmd, const char *devname);
+int setup_devno_in_dev_cache(struct cmd_context *cmd, dev_t devno);
+struct device *setup_dev_in_dev_cache(struct cmd_context *cmd, dev_t devno, const char *devname);
 
 #endif

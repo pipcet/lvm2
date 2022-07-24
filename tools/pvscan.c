@@ -18,6 +18,8 @@
 #include "lib/cache/lvmcache.h"
 #include "lib/metadata/metadata.h"
 #include "lib/label/hints.h"
+#include "lib/device/online.h"
+#include "lib/filters/filter.h"
 
 #include <dirent.h>
 
@@ -41,10 +43,6 @@ struct pvscan_aa_params {
  * when one vg is being activated.
  */
 static struct volume_group *saved_vg;
-
-static const char *_pvs_online_dir = DEFAULT_RUN_DIR "/pvs_online";
-static const char *_vgs_online_dir = DEFAULT_RUN_DIR "/vgs_online";
-static const char *_pvs_lookup_dir = DEFAULT_RUN_DIR "/pvs_lookup";
 
 static int _pvscan_display_pv(struct cmd_context *cmd,
 				  struct physical_volume *pv,
@@ -179,98 +177,18 @@ out:
 	return ret;
 }
 
-static char *_vgname_in_pvid_file_buf(char *buf)
-{
-	char *p, *n;
-
-	/*
-	 * file contains:
-	 * <major>:<minor>\n
-	 * vg:<vgname>\n\0
-	 */
-
-	if (!(p = strchr(buf, '\n')))
-		return NULL;
-
-	p++; /* skip \n */
-
-	if (*p && !strncmp(p, "vg:", 3)) {
-		if ((n = strchr(p, '\n')))
-			*n = '\0';
-		return p + 3;
-	}
-	return NULL;
-}
-
-#define MAX_PVID_FILE_SIZE 512
-
-static int _online_pvid_file_read(char *path, int *major, int *minor, char *vgname)
-{
-	char buf[MAX_PVID_FILE_SIZE] = { 0 };
-	char *name;
-	int fd, rv;
-
-	fd = open(path, O_RDONLY);
-	if (fd < 0) {
-		log_warn("Failed to open %s", path);
-		return 0;
-	}
-
-	rv = read(fd, buf, sizeof(buf) - 1);
-	if (close(fd))
-		log_sys_debug("close", path);
-	if (!rv || rv < 0) {
-		log_warn("No info in %s", path);
-		return 0;
-	}
-
-	if (sscanf(buf, "%d:%d", major, minor) != 2) {
-		log_warn("No device numbers in %s", path);
-		return 0;
-	}
-
-	/* vgname points to an offset in buf */
-	if ((name = _vgname_in_pvid_file_buf(buf)))
-		strncpy(vgname, name, NAME_LEN);
-	else
-		log_debug("No vgname in %s", path);
-
-	return 1;
-}
-
 static void _lookup_file_remove(char *vgname)
 {
 	char path[PATH_MAX];
 
-	if (dm_snprintf(path, sizeof(path), "%s/%s", _pvs_lookup_dir, vgname) < 0) {
-		log_error("Path %s/%s is too long.", _pvs_lookup_dir, vgname);
+	if (dm_snprintf(path, sizeof(path), "%s/%s", PVS_LOOKUP_DIR, vgname) < 0) {
+		log_error("Path %s/%s is too long.", PVS_LOOKUP_DIR, vgname);
 		return;
 	}
 
 	log_debug("Unlink pvs_lookup: %s", path);
 
-	if (unlink(path))
-		log_sys_debug("unlink", path);
-}
-
-/*
- * When a PV goes offline, remove the vg online file for that VG
- * (even if other PVs for the VG are still online).  This means
- * that the vg will be activated again when it becomes complete.
- */
-
-static void _online_vg_file_remove(const char *vgname)
-{
-	char path[PATH_MAX];
-
-	if (dm_snprintf(path, sizeof(path), "%s/%s", _vgs_online_dir, vgname) < 0) {
-		log_error("Path %s/%s is too long.", _vgs_online_dir, vgname);
-		return;
-	}
-
-	log_debug("Unlink vg online: %s", path);
-
-	if (unlink(path))
+	if (unlink(path) && (errno != ENOENT))
 		log_sys_debug("unlink", path);
 }
 
@@ -292,7 +210,7 @@ static void _online_pvid_file_remove_devno(int major, int minor)
 
 	log_debug("Remove pv online devno %d:%d", major, minor);
 
-	if (!(dir = opendir(_pvs_online_dir)))
+	if (!(dir = opendir(PVS_ONLINE_DIR)))
 		return;
 
 	while ((de = readdir(dir))) {
@@ -300,27 +218,27 @@ static void _online_pvid_file_remove_devno(int major, int minor)
 			continue;
 
 		memset(path, 0, sizeof(path));
-		snprintf(path, sizeof(path), "%s/%s", _pvs_online_dir, de->d_name);
+		snprintf(path, sizeof(path), "%s/%s", PVS_ONLINE_DIR, de->d_name);
 
 		file_major = 0;
 		file_minor = 0;
 		memset(file_vgname, 0, sizeof(file_vgname));
 
-		_online_pvid_file_read(path, &file_major, &file_minor, file_vgname);
+		online_pvid_file_read(path, &file_major, &file_minor, file_vgname, NULL);
 
 		if ((file_major == major) && (file_minor == minor)) {
 			log_debug("Unlink pv online %s", path);
-			if (unlink(path))
+			if (unlink(path) && (errno != ENOENT))
 				log_sys_debug("unlink", path);
 
 			if (file_vgname[0]) {
-				_online_vg_file_remove(file_vgname);
+				online_vg_file_remove(file_vgname);
 				_lookup_file_remove(file_vgname);
 			}
 		}
 	}
 	if (closedir(dir))
-		log_sys_debug("closedir", _pvs_online_dir);
+		log_sys_debug("closedir", PVS_ONLINE_DIR);
 }
 
 static void _online_files_remove(const char *dirpath)
@@ -338,133 +256,11 @@ static void _online_files_remove(const char *dirpath)
 
 		memset(path, 0, sizeof(path));
 		snprintf(path, sizeof(path), "%s/%s", dirpath, de->d_name);
-		if (unlink(path))
+		if (unlink(path) && (errno != ENOENT))
 			log_sys_debug("unlink", path);
 	}
 	if (closedir(dir))
 		log_sys_debug("closedir", dirpath);
-}
-
-static int _online_pvid_file_create(struct device *dev, const char *vgname)
-{
-	char path[PATH_MAX];
-	char buf[MAX_PVID_FILE_SIZE] = { 0 };
-	char file_vgname[NAME_LEN];
-	int file_major = 0, file_minor = 0;
-	int major, minor;
-	int fd;
-	int rv;
-	int len;
-	int len1 = 0;
-	int len2 = 0;
-
-	major = (int)MAJOR(dev->dev);
-	minor = (int)MINOR(dev->dev);
-
-	if (dm_snprintf(path, sizeof(path), "%s/%s", _pvs_online_dir, dev->pvid) < 0) {
-		log_error("Path %s/%s is too long.", _pvs_online_dir, dev->pvid);
-		return 0;
-	}
-
-	if ((len1 = dm_snprintf(buf, sizeof(buf), "%d:%d\n", major, minor)) < 0) {
-		log_error("Cannot create online file path for %s %d:%d.", dev_name(dev), major, minor);
-		return 0;
-	}
-
-	if (vgname) {
-		if ((len2 = dm_snprintf(buf + len1, sizeof(buf) - len1, "vg:%s\n", vgname)) < 0) {
-			log_warn("Incomplete online file for %s %d:%d vg %s.", dev_name(dev), major, minor, vgname);
-			/* can still continue without vgname */
-			len2 = 0;
-		}
-	}
-
-	len = len1 + len2;
-
-	log_debug("Create pv online: %s %d:%d %s", path, major, minor, dev_name(dev));
-
-	fd = open(path, O_CREAT | O_EXCL | O_RDWR, S_IRUSR | S_IWUSR);
-	if (fd < 0) {
-		if (errno == EEXIST)
-			goto check_duplicate;
-		log_error("Failed to create online file for %s path %s error %d", dev_name(dev), path, errno);
-		return 0;
-	}
-
-	while (len > 0) {
-		rv = write(fd, buf, len);
-		if (rv < 0) {
-			/* file exists so it still works in part */
-			log_warn("Cannot write online file for %s to %s error %d",
-				  dev_name(dev), path, errno);
-			if (close(fd))
-				log_sys_debug("close", path);
-			return 1;
-		}
-		len -= rv;
-	}
-
-	/* We don't care about syncing, these files are not even persistent. */
-
-	if (close(fd))
-		log_sys_debug("close", path);
-
-	return 1;
-
-check_duplicate:
-
-	/*
-	 * If a PVID online file already exists for this PVID, check if the
-	 * file contains a different device number, and if so we may have a
-	 * duplicate PV.
-	 *
-	 * FIXME: disable autoactivation of the VG somehow?
-	 * The VG may or may not already be activated when a dupicate appears.
-	 * Perhaps write a new field in the pv online or vg online file?
-	 */
-
-	memset(file_vgname, 0, sizeof(file_vgname));
-
-	_online_pvid_file_read(path, &file_major, &file_minor, file_vgname);
-
-	if ((file_major == major) && (file_minor == minor)) {
-		log_debug("Existing online file for %d:%d", major, minor);
-		return 1;
-	}
-
-	/* Don't know how vgname might not match, but it's not good so fail. */
-
-	if ((file_major != major) || (file_minor != minor))
-		log_error("pvscan[%d] PV %s is duplicate for PVID %s on %d:%d and %d:%d.",
-			  getpid(), dev_name(dev), dev->pvid, major, minor, file_major, file_minor);
-
-	if (file_vgname[0] && vgname && strcmp(file_vgname, vgname))
-		log_error("pvscan[%d] PV %s has unexpected VG %s vs %s.",
-			  getpid(), dev_name(dev), vgname, file_vgname);
-
-	return 0;
-}
-
-static int _online_pvid_file_exists(const char *pvid)
-{
-	char path[PATH_MAX] = { 0 };
-	struct stat buf;
-	int rv;
-
-	if (dm_snprintf(path, sizeof(path), "%s/%s", _pvs_online_dir, pvid) < 0) {
-		log_debug(INTERNAL_ERROR "Path %s/%s is too long.", _pvs_online_dir, pvid);
-		return 0;
-	}
-
-	log_debug("Check pv online: %s", path);
-
-	rv = stat(path, &buf);
-	if (!rv) {
-		log_debug("Check pv online %s: yes", pvid);
-		return 1;
-	}
-	log_debug("Check pv online %s: no", pvid);
-	return 0;
 }
 
 static int _write_lookup_file(struct cmd_context *cmd, struct volume_group *vg)
@@ -474,8 +270,8 @@ static int _write_lookup_file(struct cmd_context *cmd, struct volume_group *vg)
 	struct pv_list *pvl;
 	int fd;
 
-	if (dm_snprintf(path, sizeof(path), "%s/%s", _pvs_lookup_dir, vg->name) < 0) {
-		log_error("Path %s/%s is too long.", _pvs_lookup_dir, vg->name);
+	if (dm_snprintf(path, sizeof(path), "%s/%s", PVS_LOOKUP_DIR, vg->name) < 0) {
+		log_error_pvscan(cmd, "Path %s/%s is too long.", PVS_LOOKUP_DIR, vg->name);
 		return 0;
 	}
 
@@ -494,7 +290,7 @@ static int _write_lookup_file(struct cmd_context *cmd, struct volume_group *vg)
 		line[ID_LEN+1] = '\0';
 
 		if (write(fd, &line, ID_LEN+1) < 0)
-			log_sys_debug("write", path);
+			log_error_pvscan(cmd, "Failed to write lookup entry %s %s", path, line);
 	}
 
 	if (close(fd))
@@ -517,7 +313,7 @@ static int _lookup_file_contains_pvid(FILE *fp, char *pvid)
 static void _lookup_file_count_pvid_files(FILE *fp, const char *vgname, int *pvs_online, int *pvs_offline)
 {
 	char line[64];
-	char pvid[ID_LEN+1] = { 0 };
+	char pvid[ID_LEN + 1] __attribute__((aligned(8))) = { 0 };
 
 	log_debug("checking all pvid files using lookup file for %s", vgname);
 
@@ -531,7 +327,7 @@ static void _lookup_file_count_pvid_files(FILE *fp, const char *vgname, int *pvs
 			continue;
 		}
 
-		if (_online_pvid_file_exists((const char *)pvid))
+		if (online_pvid_file_exists((const char *)pvid))
 			(*pvs_online)++;
 		else
 			(*pvs_offline)++;
@@ -592,8 +388,8 @@ static int _count_pvid_files_from_lookup_file(struct cmd_context *cmd, struct de
 	*pvs_online = 0;
 	*pvs_offline = 0;
 
-	if (!(dir = opendir(_pvs_lookup_dir))) {
-		log_sys_debug("opendir", _pvs_lookup_dir);
+	if (!(dir = opendir(PVS_LOOKUP_DIR))) {
+		log_sys_debug("opendir", PVS_LOOKUP_DIR);
 		return 0;
 	}
 
@@ -605,8 +401,8 @@ static int _count_pvid_files_from_lookup_file(struct cmd_context *cmd, struct de
 		if (de->d_name[0] == '.')
 			continue;
 
-		if (dm_snprintf(path, sizeof(path), "%s/%s", _pvs_lookup_dir, de->d_name) < 0) {
-			log_warn("WARNING: Path %s/%s is too long.", _pvs_lookup_dir, de->d_name);
+		if (dm_snprintf(path, sizeof(path), "%s/%s", PVS_LOOKUP_DIR, de->d_name) < 0) {
+			log_warn("WARNING: Path %s/%s is too long.", PVS_LOOKUP_DIR, de->d_name);
 			continue;
 		}
 
@@ -631,77 +427,24 @@ static int _count_pvid_files_from_lookup_file(struct cmd_context *cmd, struct de
 			log_sys_debug("fclose", path);
 	}
 	if (closedir(dir))
-		log_sys_debug("closedir", _pvs_lookup_dir);
+		log_sys_debug("closedir", PVS_LOOKUP_DIR);
 
 	*vgname_out = vgname;
 
 	return (vgname) ? 1 : 0;
 }
 
-static void _online_dir_setup(void)
-{
-	struct stat st;
-	int rv;
-
-	if (!stat(DEFAULT_RUN_DIR, &st))
-		goto do_pvs;
-
-	log_debug("Creating run_dir.");
-	dm_prepare_selinux_context(DEFAULT_RUN_DIR, S_IFDIR);
-	rv = mkdir(DEFAULT_RUN_DIR, 0755);
-	dm_prepare_selinux_context(NULL, 0);
-
-	if ((rv < 0) && stat(DEFAULT_RUN_DIR, &st))
-		log_error("Failed to create %s %d", DEFAULT_RUN_DIR, errno);
-
-do_pvs:
-	if (!stat(_pvs_online_dir, &st))
-		goto do_vgs;
-
-	log_debug("Creating pvs_online_dir.");
-	dm_prepare_selinux_context(_pvs_online_dir, S_IFDIR);
-	rv = mkdir(_pvs_online_dir, 0755);
-	dm_prepare_selinux_context(NULL, 0);
-
-	if ((rv < 0) && stat(_pvs_online_dir, &st))
-		log_error("Failed to create %s %d", _pvs_online_dir, errno);
-
-do_vgs:
-	if (!stat(_vgs_online_dir, &st))
-		goto do_lookup;
-
-	log_debug("Creating vgs_online_dir.");
-	dm_prepare_selinux_context(_vgs_online_dir, S_IFDIR);
-	rv = mkdir(_vgs_online_dir, 0755);
-	dm_prepare_selinux_context(NULL, 0);
-
-	if ((rv < 0) && stat(_vgs_online_dir, &st))
-		log_error("Failed to create %s %d", _vgs_online_dir, errno);
-
-do_lookup:
-	if (!stat(_pvs_lookup_dir, &st))
-		return;
-
-	log_debug("Creating pvs_lookup_dir.");
-	dm_prepare_selinux_context(_pvs_lookup_dir, S_IFDIR);
-	rv = mkdir(_pvs_lookup_dir, 0755);
-	dm_prepare_selinux_context(NULL, 0);
-
-	if ((rv < 0) && stat(_pvs_lookup_dir, &st))
-		log_error("Failed to create %s %d", _pvs_lookup_dir, errno);
-
-
-}
-
 static void _count_pvid_files(struct volume_group *vg, int *pvs_online, int *pvs_offline)
 {
+	char pvid[ID_LEN + 1] __attribute__((aligned(8))) = { 0 };
 	struct pv_list *pvl;
 
 	*pvs_online = 0;
 	*pvs_offline = 0;
 
 	dm_list_iterate_items(pvl, &vg->pvs) {
-		if (_online_pvid_file_exists((const char *)&pvl->pv->id.uuid))
+		memcpy(pvid, &pvl->pv->id.uuid, ID_LEN);
+		if (online_pvid_file_exists(pvid))
 			(*pvs_online)++;
 		else
 			(*pvs_offline)++;
@@ -724,38 +467,12 @@ static int _pvscan_aa_single(struct cmd_context *cmd, const char *vg_name,
 
 	log_debug("pvscan autoactivating VG %s.", vg_name);
 
-	if (!vgchange_activate(cmd, vg, CHANGE_AAY)) {
-		log_error("%s: autoactivation failed.", vg->name);
+	if (!vgchange_activate(cmd, vg, CHANGE_AAY, 1)) {
+		log_error_pvscan(cmd, "%s: autoactivation failed.", vg->name);
 		pp->activate_errors++;
 	}
 
 	return ECMD_PROCESSED;
-}
-
-static int _online_vg_file_create(struct cmd_context *cmd, const char *vgname)
-{
-	char path[PATH_MAX];
-	int fd;
-
-	if (dm_snprintf(path, sizeof(path), "%s/%s", _vgs_online_dir, vgname) < 0) {
-		log_error("Path %s/%s is too long.", _vgs_online_dir, vgname);
-		return 0;
-	}
-
-	log_debug("Create vg online: %s", path);
-
-	fd = open(path, O_CREAT | O_EXCL | O_TRUNC | O_RDWR, S_IRUSR | S_IWUSR);
-	if (fd < 0) {
-		log_debug("Failed to create %s: %d", path, errno);
-		return 0;
-	}
-
-	/* We don't care about syncing, these files are not even persistent. */
-
-	if (close(fd))
-		log_sys_debug("close", path);
-
-	return 1;
 }
 
 /*
@@ -793,12 +510,13 @@ static int _get_devs_from_saved_vg(struct cmd_context *cmd, const char *vgname,
 {
 	char path[PATH_MAX];
 	char file_vgname[NAME_LEN];
+	char file_devname[NAME_LEN];
+	char pvid[ID_LEN + 1] __attribute__((aligned(8))) = { 0 };
 	char uuidstr[64] __attribute__((aligned(8)));
 	struct pv_list *pvl;
 	struct device_list *devl;
 	struct device *dev;
 	struct volume_group *vg;
-	const char *pvid;
 	const char *name1, *name2;
 	dev_t devno;
 	int file_major = 0, file_minor = 0;
@@ -814,37 +532,44 @@ static int _get_devs_from_saved_vg(struct cmd_context *cmd, const char *vgname,
 		goto_bad;
 
 	dm_list_iterate_items(pvl, &vg->pvs) {
-		pvid = (const char *)&pvl->pv->id.uuid;
+		memcpy(pvid, &pvl->pv->id.uuid, ID_LEN);
 
 		memset(path, 0, sizeof(path));
-		snprintf(path, sizeof(path), "%s/%s", _pvs_online_dir, pvid);
+		snprintf(path, sizeof(path), "%s/%s", PVS_ONLINE_DIR, pvid);
 
 		file_major = 0;
 		file_minor = 0;
 		memset(file_vgname, 0, sizeof(file_vgname));
+		memset(file_devname, 0, sizeof(file_devname));
 
-		_online_pvid_file_read(path, &file_major, &file_minor, file_vgname);
+		online_pvid_file_read(path, &file_major, &file_minor, file_vgname, file_devname);
 
 		if (file_vgname[0] && strcmp(vgname, file_vgname)) {
-			log_error("Wrong VG found for %d:%d PVID %s: %s vs %s",
-				  file_major, file_minor, pvid, vgname, file_vgname);
+			log_error_pvscan(cmd, "Wrong VG found for %d:%d PVID %s: %s vs %s",
+				         file_major, file_minor, pvid, vgname, file_vgname);
 			goto bad;
 		}
 
 		devno = MKDEV(file_major, file_minor);
 
-		if (!(dev = dev_cache_get_by_devt(cmd, devno, NULL, NULL))) {
-			log_error("No device found for %d:%d PVID %s", file_major, file_minor, pvid);
+		if (!(dev = setup_dev_in_dev_cache(cmd, devno, file_devname[0] ? file_devname : NULL))) {
+			log_error_pvscan(cmd, "No device set up for online PV %d:%d %s PVID %s", file_major, file_minor, file_devname, pvid);
 			goto bad;
 		}
+
+		/*
+		 * Do not need to match device_id here, see comment after
+		 * get_devs_from_saved_vg about relying on pvid online file.
+		 */
 
 		name1 = dev_name(dev);
 		name2 = pvl->pv->device_hint;
 
-		if (strcmp(name1, name2)) {
+		/* Probably pointless since dev is from online file which was already checked. */
+		if (!strncmp(name2, "/dev/md", 7) && strncmp(name1, "/dev/md", 7)) {
 			if (!id_write_format((const struct id *)pvid, uuidstr, sizeof(uuidstr)))
 				uuidstr[0] = '\0';
-			log_print("PVID %s read from %s last written to %s.", uuidstr, name1, name2);
+			log_print_pvscan(cmd, "PVID %s read from %s last written to %s.", uuidstr, name1, name2);
 			goto bad;
 		}
 
@@ -921,10 +646,18 @@ static int _pvscan_aa_quick(struct cmd_context *cmd, struct pvscan_aa_params *pp
 	 * The dev_cache gives us struct devices from the devnums.
 	 */
 	if (!_get_devs_from_saved_vg(cmd, vgname, &devs)) {
-		log_print("pvscan[%d] VG %s not using quick activation.", getpid(), vgname);
+		log_print_pvscan(cmd, "VG %s not using quick activation.", vgname);
 		*no_quick = 1;
 		return ECMD_FAILED;
 	}
+
+	/*
+	 * The list of devs do not need to be filtered or checked
+	 * against the devices file because a dev is only returned
+	 * that has a pv online file, and a dev will only have a
+	 * pv online file if it's been processed by a previous
+	 * pvscan, which did the filtering and devices file check.
+	 */
 
 	/*
 	 * Lock the VG before scanning so we don't need to
@@ -932,7 +665,7 @@ static int _pvscan_aa_quick(struct cmd_context *cmd, struct pvscan_aa_params *pp
 	 * label rescan are then disabled in vg_read.)
 	 */
 	if (!lock_vol(cmd, vgname, LCK_VG_WRITE, NULL)) {
-		log_error("pvscan activation for VG %s failed to lock VG.", vgname);
+		log_error_pvscan(cmd, "activation for VG %s failed to lock VG.", vgname);
 		return ECMD_FAILED;
 	}
 
@@ -945,7 +678,7 @@ static int _pvscan_aa_quick(struct cmd_context *cmd, struct pvscan_aa_params *pp
 	label_scan_devs(cmd, NULL, &devs);
 
 	if (!(vgid = lvmcache_vgid_from_vgname(cmd, vgname))) {
-		log_error("pvscan activation for VG %s failed to find vgid.", vgname);
+		log_error_pvscan(cmd, "activation for VG %s failed to find vgid.", vgname);
 		return ECMD_FAILED;
 	}
 
@@ -965,7 +698,7 @@ static int _pvscan_aa_quick(struct cmd_context *cmd, struct pvscan_aa_params *pp
 		 * original device arg scan.  There will be very few and unusual
 		 * cases that would be caught here.
 		 */
-		log_error("pvscan activation for VG %s cannot read (%x).", vgname, error_flags);
+		log_error_pvscan(cmd, "activation for VG %s cannot read (%x).", vgname, error_flags);
 		return ECMD_FAILED;
 	}
 
@@ -987,15 +720,15 @@ static int _pvscan_aa_quick(struct cmd_context *cmd, struct pvscan_aa_params *pp
 	dm_list_iterate_items(pvl, &vg->pvs) {
 		if (dev_in_device_list(pvl->pv->dev, &devs))
 			continue;
-		log_error("pvscan activation for VG %s found different devices.", vgname);
+		log_error_pvscan(cmd, "activation for VG %s found different devices.", vgname);
 		ret = ECMD_FAILED;
 		goto out;
 	}
 
 	log_debug("pvscan autoactivating VG %s.", vgname);
 
-	if (!vgchange_activate(cmd, vg, CHANGE_AAY)) {
-		log_error("%s: autoactivation failed.", vg->name);
+	if (!vgchange_activate(cmd, vg, CHANGE_AAY, 1)) {
+		log_error_pvscan(cmd, "%s: autoactivation failed.", vg->name);
 		pp->activate_errors++;
 	}
 
@@ -1014,7 +747,7 @@ static int _pvscan_aa(struct cmd_context *cmd, struct pvscan_aa_params *pp,
 	int ret = ECMD_FAILED;
 
 	if (!(handle = init_processing_handle(cmd, NULL))) {
-		log_error("Failed to initialize processing handle.");
+		log_error_pvscan(cmd, "Failed to initialize processing handle.");
 		goto out;
 	}
 
@@ -1028,12 +761,12 @@ static int _pvscan_aa(struct cmd_context *cmd, struct pvscan_aa_params *pp,
 	 * to run the activation.  The first to create the file will do it.
 	 */
 	dm_list_iterate_items_safe(sl, sl2, vgnames) {
-		if (!_online_vg_file_create(cmd, sl->str)) {
-			log_print("pvscan[%d] VG %s skip autoactivation.", getpid(), sl->str);
+		if (!online_vg_file_create(cmd, sl->str)) {
+			log_print_pvscan(cmd, "VG %s skip autoactivation.", sl->str);
 			str_list_del(vgnames, sl->str);
 			continue;
 		}
-		log_print("pvscan[%d] VG %s run autoactivation.", getpid(), sl->str);
+		log_print_pvscan(cmd, "VG %s run autoactivation.", sl->str);
 	}
 
 	if (dm_list_empty(vgnames)) {
@@ -1060,9 +793,19 @@ static int _pvscan_aa(struct cmd_context *cmd, struct pvscan_aa_params *pp,
 	 */
 	if (!saved_vg || (dm_list_size(vgnames) > 1) || no_quick) {
 		uint32_t read_flags = READ_FOR_ACTIVATE;
-		if (do_all)
-			read_flags |= PROCESS_SKIP_SCAN;
+
 		log_debug("autoactivate slow");
+
+		/*
+		 * PROCESS_SKIP_SCAN: we have already done lvmcache_label_scan
+		 * so tell process_each to skip it.
+		 */
+
+		if (!do_all)
+			lvmcache_label_scan(cmd);
+
+		read_flags |= PROCESS_SKIP_SCAN;
+
 		ret = process_each_vg(cmd, 0, NULL, NULL, vgnames, read_flags, 0, handle, _pvscan_aa_single);
 	}
 
@@ -1073,6 +816,49 @@ out:
 		saved_vg = NULL;
 	}
 	return ret;
+}
+
+/*
+ * The optimization in which only the pvscan arg devname is added to dev-cache
+ * does not work if there's an lvm.conf filter containing symlinks to the dev
+ * like /dev/disk/by-id/lvm-pv-uuid-xyz entries.  A full dev_cache_scan will
+ * associate the symlinks with the system dev name passed to pvscan, which lets
+ * filter-regex match the devname with the symlink name in the filter.
+ */
+static int _filter_uses_symlinks(struct cmd_context *cmd, int filter_cfg)
+{
+	const struct dm_config_node *cn;
+	const struct dm_config_value *cv;
+	const char *fname;
+
+	if ((cn = find_config_tree_array(cmd, filter_cfg, NULL))) {
+        	for (cv = cn->v; cv; cv = cv->next) {
+			if (cv->type != DM_CFG_STRING)
+				continue;
+			if (!cv->v.str)
+				continue;
+
+			fname = cv->v.str;
+
+			if (fname[0] != 'a')
+				continue;
+
+			if (strstr(fname, "/dev/disk/"))
+				return 1;
+			if (strstr(fname, "/dev/mapper/"))
+				return 1;
+
+			/* In case /dev/disk/by was omitted */
+			if (strstr(fname, "lvm-pv-uuid"))
+				return 1;
+			if (strstr(fname, "dm-uuid"))
+				return 1;
+			if (strstr(fname, "wwn-"))
+				return 1;
+		}
+	}
+
+	return 0;
 }
 
 struct pvscan_arg {
@@ -1139,17 +925,41 @@ static int _get_args_devs(struct cmd_context *cmd, struct dm_list *pvscan_args,
 	struct pvscan_arg *arg;
 	struct device_list *devl;
 
+	/*
+	 * If no devices file is used, and lvm.conf filter is set to
+	 * accept /dev/disk/by-id/lvm-pv-uuid-xyz or another symlink,
+	 * but pvscan --cache is passed devname or major:minor, so
+	 * pvscan needs to match its arg device to the filter symlink.
+	 * setup_dev_in_dev_cache() adds /dev/sda2 to dev-cache which
+	 * does not match a symlink to /dev/sda2, so we need a full
+	 * dev_cache_scan that will associate all symlinks to sda2,
+	 * which allows filter-regex to work.  This case could be
+	 * optimized if needed by adding dev-cache entries for each
+	 * filter "a" entry (filter symlink patterns would still need
+	 * a full dev_cache_scan.)
+	 * (When no devices file is used and 69-dm-lvm.rules is
+	 * used which calls pvscan directly, symlinks may not
+	 * have been created by other rules when pvscan runs, so
+	 * the full dev_cache_scan may still not find them.)
+	 */
+	if (!cmd->enable_devices_file && !cmd->enable_devices_list &&
+	    (_filter_uses_symlinks(cmd, devices_filter_CFG) ||
+	     _filter_uses_symlinks(cmd, devices_global_filter_CFG))) {
+		log_print_pvscan(cmd, "finding all devices for filter symlinks.");
+		dev_cache_scan(cmd);
+	}
+
 	/* pass NULL filter when getting devs from dev-cache, filtering is done separately */
 
 	/* in common usage, no dev will be found for a devno */
 
 	dm_list_iterate_items(arg, pvscan_args) {
-		if (arg->devname)
-			arg->dev = dev_cache_get(cmd, arg->devname, NULL);
-		else if (arg->devno)
-			arg->dev = dev_cache_get_by_devt(cmd, arg->devno, NULL, NULL);
-		else
+		if (!arg->devname && !arg->devno)
 			return_0;
+		if (!(arg->dev = setup_dev_in_dev_cache(cmd, arg->devno, arg->devname))) {
+			log_error_pvscan(cmd, "No device set up for arg %s %d:%d",
+					 arg->devname ?: "", (int)MAJOR(arg->devno), (int)MINOR(arg->devno));
+		}
 	}
 
 	dm_list_iterate_items(arg, pvscan_args) {
@@ -1165,6 +975,66 @@ static int _get_args_devs(struct cmd_context *cmd, struct dm_list *pvscan_args,
 	return 1;
 }
 
+static void _set_pv_devices_online(struct cmd_context *cmd, struct volume_group *vg)
+{
+	char path[PATH_MAX];
+	char file_vgname[NAME_LEN];
+	char file_devname[NAME_LEN];
+	char pvid[ID_LEN+1] = { 0 };
+	struct pv_list *pvl;
+	struct device *dev;
+	int major, minor;
+	dev_t devno;
+
+	dm_list_iterate_items(pvl, &vg->pvs) {
+		memcpy(&pvid, &pvl->pv->id.uuid, ID_LEN);
+
+		if (pvl->pv->status & MISSING_PV) {
+			log_debug("set_pv_devices_online vg %s pv %s missing flag already set",
+				  vg->name, pvid);
+			continue;
+		}
+
+		if (!online_pvid_file_exists(pvid)) {
+			log_debug("set_pv_devices_online vg %s pv %s no online file",
+				  vg->name, pvid);
+			pvl->pv->status |= MISSING_PV;
+			continue;
+		}
+
+		memset(path, 0, sizeof(path));
+		snprintf(path, sizeof(path), "%s/%s", PVS_ONLINE_DIR, pvid);
+
+		major = 0;
+		minor = 0;
+		memset(file_vgname, 0, sizeof(file_vgname));
+		memset(file_devname, 0, sizeof(file_devname));
+
+		online_pvid_file_read(path, &major, &minor, file_vgname, file_devname);
+
+		if (file_vgname[0] && strcmp(vg->name, file_vgname)) {
+			log_warn("WARNING: VG %s PV %s wrong vgname in online file %s",
+				  vg->name, pvid, file_vgname);
+			pvl->pv->status |= MISSING_PV;
+			continue;
+		}
+
+		devno = MKDEV(major, minor);
+
+		if (!(dev = setup_dev_in_dev_cache(cmd, devno, file_devname[0] ? file_devname : NULL))) {
+			log_print_pvscan(cmd, "VG %s PV %s no device found for online PV %d:%d %s",
+					 vg->name, pvid, major, minor, file_devname);
+			pvl->pv->status |= MISSING_PV;
+			continue;
+		}
+
+		log_debug("set_pv_devices_online vg %s pv %s is online %s",
+			  vg->name, pvid, dev_name(dev));
+
+		pvl->pv->dev = dev;
+	}
+}
+
 static int _online_devs(struct cmd_context *cmd, int do_all, struct dm_list *pvscan_devs,
 			int *pv_count, struct dm_list *complete_vgnames)
 {
@@ -1177,15 +1047,20 @@ static int _online_devs(struct cmd_context *cmd, int do_all, struct dm_list *pvs
 	struct metadata_area *mda1, *mda2;
 	struct volume_group *vg;
 	struct physical_volume *pv;
-	const char *vgname;
-	uint32_t ext_version, ext_flags;
+	const char *vgname = NULL;
 	uint64_t devsize;
+	uint32_t ext_version, ext_flags;
+	int do_cache = arg_is_set(cmd, cache_long_ARG);
 	int do_activate = arg_is_set(cmd, activate_ARG);
-	int do_full_check;
+	int do_list_lvs = arg_is_set(cmd, listlvs_ARG);
+	int do_list_vg = arg_is_set(cmd, listvg_ARG);
+	int do_check_complete = arg_is_set(cmd, checkcomplete_ARG);
+	int do_vgonline = arg_is_set(cmd, vgonline_ARG);
 	int pvs_online;
 	int pvs_offline;
 	int pvs_unknown;
-	int vg_complete;
+	int vg_complete = 0;
+	int do_full_check;
 	int ret = 1;
 
 	dm_list_iterate_items_safe(devl, devl2, pvscan_devs) {
@@ -1193,32 +1068,27 @@ static int _online_devs(struct cmd_context *cmd, int do_all, struct dm_list *pvs
 
 		log_debug("online_devs %s %s", dev_name(dev), dev->pvid);
 
-		/*
-		 * This should already have been done by the filter, but make
-		 * another check directly with udev in case the filter was not
-		 * using udev and the native version didn't catch it.
-		 */
-		if (udev_dev_is_mpath_component(dev)) {
-			log_print("pvscan[%d] ignore multipath component %s.", getpid(), dev_name(dev));
-			continue;
-		}
-
 		if (!(info = lvmcache_info_from_pvid(dev->pvid, dev, 0))) {
 			if (!do_all)
-				log_print("pvscan[%d] ignore %s with no lvm info.", getpid(), dev_name(dev));
+				log_print_pvscan(cmd, "ignore %s with no lvm info.", dev_name(dev));
 			continue;
 		}
 
 		ext_version = lvmcache_ext_version(info);
 		ext_flags = lvmcache_ext_flags(info);
 		if ((ext_version >= 2) && !(ext_flags & PV_EXT_USED)) {
-			log_print("pvscan[%d] PV %s not used.", getpid(), dev_name(dev));
+			log_print_pvscan(cmd, "PV %s not used.", dev_name(dev));
 			(*pv_count)++;
 			continue;
 		}
 
 		fmt = lvmcache_fmt(info);
-		fid = fmt->ops->create_instance(fmt, &fic);
+		if (!(fid = fmt->ops->create_instance(fmt, &fic))) {
+			log_error("pvscan[%d] failed to create format instance.", getpid());
+			ret = 0;
+			continue;
+		}
+
 		vg = NULL;
 
 		mda1 = lvmcache_get_dev_mda(dev, 1);
@@ -1231,7 +1101,7 @@ static int _online_devs(struct cmd_context *cmd, int do_all, struct dm_list *pvs
 			vg = mda2->ops->vg_read(cmd, fid, "", mda2, NULL, NULL);
 
 		if (!vg) {
-			log_print("pvscan[%d] PV %s has no VG metadata.", getpid(), dev_name(dev));
+			log_print_pvscan(cmd, "PV %s has no VG metadata.", dev_name(dev));
 			if (fid)
 				fmt->ops->destroy_instance(fid);
 			goto online;
@@ -1240,31 +1110,36 @@ static int _online_devs(struct cmd_context *cmd, int do_all, struct dm_list *pvs
 		set_pv_devices(fid, vg);
 
 		if (!(pv = find_pv(vg, dev))) {
-			log_print("pvscan[%d] PV %s not found in VG %s.", getpid(), dev_name(dev), vg->name);
+			log_print_pvscan(cmd, "PV %s not found in VG %s.", dev_name(dev), vg->name);
 			release_vg(vg);
 			continue;
 		}
 
 		devsize = dev->size;
-		if (!devsize)
-			dev_get_size(dev, &devsize);
+		if (!devsize &&
+		    !dev_get_size(dev, &devsize)) {
+			log_print_pvscan(cmd, "PV %s missing device size.", dev_name(dev));
+			release_vg(vg);
+			continue;
+		}
 		do_full_check = 0;
 
 		/* If use_full_md_check is set then this has already been done by filter. */
-		if (!cmd->use_full_md_check) {
+		if (!cmd->use_full_md_check && (cmd->dev_types->md_major != MAJOR(dev->dev))) {
 			if (devsize && (pv->size != devsize))
 				do_full_check = 1;
 			if (pv->device_hint && !strncmp(pv->device_hint, "/dev/md", 7))
 				do_full_check = 1;
 		}
-		if (do_full_check && dev_is_md_component(dev, NULL, 1)) {
-			log_print("pvscan[%d] ignore md component %s.", getpid(), dev_name(dev));
+
+		if (do_full_check && dev_is_md_component(cmd, dev, NULL, 1)) {
+			log_print_pvscan(cmd, "ignore md component %s.", dev_name(dev));
 			release_vg(vg);
 			continue;
 		}
 
 		if (vg_is_shared(vg)) {
-			log_print("pvscan[%d] PV %s ignore shared VG.", getpid(), dev_name(dev));
+			log_print_pvscan(cmd, "PV %s ignore shared VG.", dev_name(dev));
 			release_vg(vg);
 			continue;
 		}
@@ -1274,7 +1149,13 @@ static int _online_devs(struct cmd_context *cmd, int do_all, struct dm_list *pvs
 		    vg_is_foreign(vg)) {
 			log_verbose("Ignore PV %s with VG system id %s with our system id %s",
 				    dev_name(dev), vg->system_id, cmd->system_id);
-			log_print("pvscan[%d] PV %s ignore foreign VG.", getpid(), dev_name(dev));
+			log_print_pvscan(cmd, "PV %s ignore foreign VG.", dev_name(dev));
+			release_vg(vg);
+			continue;
+		}
+
+		if (vg_is_exported(vg)) {
+			log_print_pvscan(cmd, "PV %s ignore exported VG.", dev_name(dev));
 			release_vg(vg);
 			continue;
 		}
@@ -1293,19 +1174,20 @@ static int _online_devs(struct cmd_context *cmd, int do_all, struct dm_list *pvs
 
 		/*
 		 * Create file named for pvid to record this PV is online.
+		 * The command creates/checks online files only when --cache is used.
 		 */
-		if (!_online_pvid_file_create(dev, vg ? vg->name : NULL)) {
-			log_error("pvscan[%d] PV %s failed to create online file.", getpid(), dev_name(dev));
+		if (do_cache && !online_pvid_file_create(cmd, dev, vg ? vg->name : NULL)) {
+			log_error_pvscan(cmd, "PV %s failed to create online file.", dev_name(dev));
 			release_vg(vg);
 			ret = 0;
 			continue;
 		}
 
 		/*
-		 * When not activating we don't need to know about vg completeness.
+		 * A plain pvscan --cache <dev> just creates the online file.
 		 */
-		if (!do_activate) {
-			log_print("pvscan[%d] PV %s online.", getpid(), dev_name(dev));
+		if (!do_activate && !do_list_lvs && !do_list_vg) {
+			log_print_pvscan(cmd, "PV %s online.", dev_name(dev));
 			release_vg(vg);
 			continue;
 		}
@@ -1313,58 +1195,176 @@ static int _online_devs(struct cmd_context *cmd, int do_all, struct dm_list *pvs
 		/*
 		 * Check if all the PVs for this VG are online.  If the arrival
 		 * of this dev completes the VG, then save the vgname in
-		 * complete_vgnames so it will be activated.
+		 * complete_vgnames (activation phase will want to know which
+		 * VGs to activate.)
 		 */
-		pvs_online = 0;
-		pvs_offline = 0;
-		pvs_unknown = 0;
-		vg_complete = 0;
+		if (do_activate || do_check_complete) {
+			pvs_online = 0;
+			pvs_offline = 0;
+			pvs_unknown = 0;
+			vg_complete = 0;
 
-		if (vg) {
-			/*
-			 * Use the VG metadata from this PV for a list of all
-			 * PVIDs.  Write a lookup file of PVIDs in case another
-			 * pvscan needs it.  After writing lookup file, recheck
-			 * pvid files to resolve a possible race with another
-			 * pvscan reading the lookup file that missed it.
-			 */
-			log_debug("checking all pvid files from vg %s", vg->name);
-			_count_pvid_files(vg, &pvs_online, &pvs_offline);
-
-			if (pvs_offline && _write_lookup_file(cmd, vg)) {
-				log_debug("rechecking all pvid files from vg %s", vg->name);
+			if (vg) {
+				/*
+				 * Check if the VG is complete by checking that
+				 * pvs_online/<pvid> files exist for all vg->pvs.
+				 */
+				log_debug("checking all pvid files from vg %s", vg->name);
 				_count_pvid_files(vg, &pvs_online, &pvs_offline);
-				if (!pvs_offline)
-					log_print("pvscan[%d] VG %s complete after recheck.", getpid(), vg->name);
+
+				/*
+				 * When there is more than one PV in the VG, write
+				 * /run/lvm/pvs_lookup/<vgname> with a list of PVIDs in
+				 * the VG.  This is used in case a later PV comes
+				 * online that has no metadata, in which case pvscan
+				 * for that PV needs to use the lookup file to check if
+				 * the VG is complete.  The lookup file is also used by
+				 * vgchange -aay --autoactivation event <vgname>
+				 * to check if all pvs_online files for the VG exist.
+				 *
+				 * For multiple concurrent pvscan's, they will race to
+				 * create the lookup file and the first will succeed.
+				 *
+				 * After writing the lookup file, recheck pvid files to
+				 * resolve a possible race with another pvscan reading
+				 * the lookup file that missed it.
+				 */
+				if (dm_list_size(&vg->pvs) > 1) {
+					if (_write_lookup_file(cmd, vg)) {
+						if (pvs_offline) {
+							log_debug("rechecking all pvid files from vg %s", vg->name);
+							_count_pvid_files(vg, &pvs_online, &pvs_offline);
+							if (!pvs_offline)
+								log_print_pvscan(cmd, "VG %s complete after recheck.", vg->name);
+						}
+					}
+				}
+				vgname = vg->name;
+			} else {
+				/*
+				 * No VG metadata on this PV, so try to use a lookup
+				 * file written by a prior pvscan for a list of all
+				 * PVIDs.  A lookup file may not exist for this PV if
+				 * it's the first to appear from the VG.
+				 */
+				log_debug("checking all pvid files from lookup file");
+				if (!_count_pvid_files_from_lookup_file(cmd, dev, &pvs_online, &pvs_offline, &vgname))
+					pvs_unknown = 1;
+			}
+	
+			if (pvs_unknown) {
+				log_print_pvscan(cmd, "PV %s online, VG unknown.", dev_name(dev));
+				vg_complete = 0;
+	
+			} else if (pvs_offline) {
+				log_print_pvscan(cmd, "PV %s online, VG %s incomplete (need %d).",
+						 dev_name(dev), vgname, pvs_offline);
+				vg_complete = 0;
+	
+			} else {
+				log_print_pvscan(cmd, "PV %s online, VG %s is complete.", dev_name(dev), vgname);
+				if (!str_list_add(cmd->mem, complete_vgnames, dm_pool_strdup(cmd->mem, vgname)))
+					stack;
+				vg_complete = 1;
+			}
+		}
+
+		if (!vgname && vg)
+			vgname = vg->name;
+
+		if (do_list_vg || do_list_lvs) {
+			if (!vgname) {
+				log_print("VG unknown");
+			} else if (!do_check_complete) {
+				log_print("VG %s", vgname);
+			} else if (vg_complete) {
+				if (do_vgonline && !online_vg_file_create(cmd, vgname)) {
+					log_print("VG %s finished", vgname);
+				} else {
+					/*
+					 * A udev rule imports KEY=val from a program's stdout.
+					 * Other output causes udev to ignore everything.
+					 * Run pvscan from udev rule using --udevoutput to
+					 * enable this printf, and suppress all log output
+					 */
+					if (arg_is_set(cmd, udevoutput_ARG))
+						printf("LVM_VG_NAME_COMPLETE='%s'\n", vgname);
+					else
+						log_print("VG %s complete", vgname);
+				}
+			} else {
+				if (arg_is_set(cmd, udevoutput_ARG))
+					printf("LVM_VG_NAME_INCOMPLETE='%s'\n", vgname);
+				else
+					log_print("VG %s incomplete", vgname);
 			}
 
-			vgname = vg->name;
-		} else {
 			/*
-			 * No VG metadata on this PV, so try to use a lookup
-			 * file written by a prior pvscan for a list of all
-			 * PVIDs.  A lookup file may not exist for this PV if
-			 * it's the first to appear from the VG.
+			 * When the VG is complete|finished, we could print
+			 * a list of devices in the VG, by reading the pvid files
+			 * that were counted, which provides major:minor of each
+			 * device and using that to get the struct dev and dev_name.
+			 * The user could pass this list of devices to --devices
+			 * to optimize a subsequent command (activation) on the VG.
+			 * Just call set_pv_devices_online (if not done othewise)
+			 * since that finds the devs.
 			 */
-			log_debug("checking all pvid files from lookup file");
-			if (!_count_pvid_files_from_lookup_file(cmd, dev, &pvs_online, &pvs_offline, &vgname))
-				pvs_unknown = 1;
 		}
 
-		if (pvs_unknown) {
-			log_print("pvscan[%d] PV %s online, VG unknown.",
-				  getpid(), dev_name(dev));
-		} else if (pvs_offline) {
-			log_print("pvscan[%d] PV %s online, VG %s incomplete (need %d).",
-				  getpid(), dev_name(dev), vgname, pvs_offline);
-		} else {
-			log_print("pvscan[%d] PV %s online, VG %s is complete.", getpid(), dev_name(dev), vgname);
-			if (!str_list_add(cmd->mem, complete_vgnames, dm_pool_strdup(cmd->mem, vgname)))
-				stack;
-			vg_complete = 1;
+		if (do_list_lvs && !vg) {
+			/* require all PVs used for booting have metadata */
+			log_print_pvscan(cmd, "Cannot list LVs from device without metadata.");
 		}
 
-		if (!saved_vg && vg && vg_complete && !do_all && (dm_list_size(pvscan_devs) == 1))
+		if (do_list_lvs && vg) {
+			struct dm_list lvs_list;
+			struct lv_list *lvl;
+
+			dm_list_init(&lvs_list);
+
+			/*
+			 * For each vg->pvs entry, get the dev based on the online file
+			 * for the pvid and set pv->dev or pv->status MISSING_PV.
+			 */
+			_set_pv_devices_online(cmd, vg);
+
+			/*
+			 * lvs_list are LVs that use dev.
+			 */
+			if (!get_visible_lvs_using_pv(cmd, vg, dev, &lvs_list))
+				log_print_pvscan(cmd, "Failed to find LVs using %s.", dev_name(dev));
+
+			if (!do_check_complete) {
+				dm_list_iterate_items(lvl, &lvs_list)
+					log_print("LV %s", display_lvname(lvl->lv));
+			} else if (vg_complete) {
+				/*
+				 * A shortcut; the vg complete implies all lvs are complete.
+				 */
+				dm_list_iterate_items(lvl, &lvs_list)
+					log_print("LV %s complete", display_lvname(lvl->lv));
+			} else {
+				/*
+				 * For each LV in VG, check if all devs are present.
+				 * Sets the PARTIAL flag on LVs that are not complete.
+				 */
+				if (!vg_mark_partial_lvs(vg, 1))
+					log_print_pvscan(cmd, "Failed to check partial lvs.");
+
+				dm_list_iterate_items(lvl, &lvs_list) {
+					if (!lv_is_partial(lvl->lv))
+						log_print("LV %s complete", display_lvname(lvl->lv));
+					else
+						log_print("LV %s incomplete", display_lvname(lvl->lv));
+				}
+			}
+		}
+
+		/*
+		 * When "pvscan --cache -aay <dev>" completes the vg, save the
+		 * struct vg to use for quick activation function.
+		 */
+		if (do_activate && !saved_vg && vg && vg_complete && !do_all && (dm_list_size(pvscan_devs) == 1))
 			saved_vg = vg;
 		else
 			release_vg(vg);
@@ -1384,9 +1384,9 @@ static int _pvscan_cache_all(struct cmd_context *cmd, int argc, char **argv,
 
 	dm_list_init(&pvscan_devs);
 
-	_online_files_remove(_pvs_online_dir);
-	_online_files_remove(_vgs_online_dir);
-	_online_files_remove(_pvs_lookup_dir);
+	_online_files_remove(PVS_ONLINE_DIR);
+	_online_files_remove(VGS_ONLINE_DIR);
+	_online_files_remove(PVS_LOOKUP_DIR);
 
 	unlink_searched_devnames(cmd);
 
@@ -1436,6 +1436,27 @@ static int _pvscan_cache_all(struct cmd_context *cmd, int argc, char **argv,
 	return 1;
 }
 
+/*
+ * If /dev/sda* of /dev/vda* is excluded by the devices file
+ * it's usually a misconfiguration that prevents proper booting,
+ * so make it a special case to give extra info to help debugging.
+ */
+static void _warn_excluded_root(struct cmd_context *cmd, struct device *dev)
+{
+	struct dev_use *du;
+	const char *cur_idname;
+
+	if (!(du = get_du_for_devname(cmd, dev_name(dev)))) {
+		log_warn("WARNING: no autoactivation for %s: not found in system.devices.", dev_name(dev));
+		return;
+	}
+
+	cur_idname = device_id_system_read(cmd, dev, du->idtype);
+
+	log_warn("WARNING: no autoactivation for %s: system.devices %s current %s.",
+		 dev_name(dev), du->idname, cur_idname ?: "missing device id");
+}
+
 static int _pvscan_cache_args(struct cmd_context *cmd, int argc, char **argv,
 			      struct dm_list *complete_vgnames)
 {
@@ -1450,10 +1471,17 @@ static int _pvscan_cache_args(struct cmd_context *cmd, int argc, char **argv,
 	dm_list_init(&pvscan_args);
 	dm_list_init(&pvscan_devs);
 
-	cmd->pvscan_cache_single = 1;
+	cmd->expect_missing_vg_device = 1;
 
-	if (!setup_devices(cmd)) {
-		log_error("Failed to set up devices.");
+	/*
+	 * Special pvscan-specific setup steps to avoid looking
+	 * at any devices except for device args.
+	 * Read devices file and determine if devices file will be used.
+	 * Does not do dev_cache_scan (adds nothing to dev-cache), and
+	 * does not do any device id matching.
+	 */
+	if (!setup_devices_for_online_autoactivation(cmd)) {
+		log_error_pvscan(cmd, "Failed to set up devices.");
 		return 0;
 	}
 
@@ -1510,6 +1538,23 @@ static int _pvscan_cache_args(struct cmd_context *cmd, int argc, char **argv,
 	 
 	log_debug("pvscan_cache_args: filter devs nodata");
 
+	/*
+	 * Match dev args with the devices file because special/optimized
+	 * device setup was used above which does not check the devices file.
+	 * If a match fails here do not exclude it, that will be done below by
+	 * passes_filter() which runs filter-deviceid. The
+	 * relax_deviceid_filter case needs to be able to work around
+	 * unmatching devs.
+	 */
+
+	if (cmd->enable_devices_file) {
+		dm_list_iterate_items(devl, &pvscan_devs)
+			device_ids_match_dev(cmd, devl->dev);
+
+	}
+	if (cmd->enable_devices_list)
+		device_ids_match_device_list(cmd);
+
 	if (cmd->enable_devices_file && device_ids_use_devname(cmd)) {
 		relax_deviceid_filter = 1;
 		cmd->filter_deviceid_skip = 1;
@@ -1519,9 +1564,15 @@ static int _pvscan_cache_args(struct cmd_context *cmd, int argc, char **argv,
 
 	dm_list_iterate_items_safe(devl, devl2, &pvscan_devs) {
 		if (!cmd->filter->passes_filter(cmd, cmd->filter, devl->dev, NULL)) {
-			log_print("pvscan[%d] %s excluded by filters: %s.", getpid(),
-				  dev_name(devl->dev), dev_filtered_reason(devl->dev));
+			log_print_pvscan(cmd, "%s excluded: %s.",
+					 dev_name(devl->dev), dev_filtered_reason(devl->dev));
 			dm_list_del(&devl->list);
+
+			/* Special case warning when probable root dev is missing from system.devices */
+			if ((devl->dev->filtered_flags & DEV_FILTERED_DEVICES_FILE) &&
+			    (!strncmp(dev_name(devl->dev), "/dev/sda", 8) ||
+			     !strncmp(dev_name(devl->dev), "/dev/vda", 8)))
+				_warn_excluded_root(cmd, devl->dev);
 		}
 	}
 
@@ -1549,14 +1600,14 @@ static int _pvscan_cache_args(struct cmd_context *cmd, int argc, char **argv,
 		int has_pvid;
 
 		if (!label_read_pvid(devl->dev, &has_pvid)) {
-			log_print("pvscan[%d] %s cannot read.", getpid(), dev_name(devl->dev));
+			log_print_pvscan(cmd, "%s cannot read label.", dev_name(devl->dev));
 			dm_list_del(&devl->list);
 			continue;
 		}
 
 		if (!has_pvid) {
 			/* Not an lvm device */
-			log_print("pvscan[%d] %s not an lvm device.", getpid(), dev_name(devl->dev));
+			log_print_pvscan(cmd, "%s not an lvm device.", dev_name(devl->dev));
 			dm_list_del(&devl->list);
 			continue;
 		}
@@ -1567,8 +1618,8 @@ static int _pvscan_cache_args(struct cmd_context *cmd, int argc, char **argv,
 		 */
 		if (relax_deviceid_filter) {
 			if (!get_du_for_pvid(cmd, devl->dev->pvid)) {
-				log_print("pvscan[%d] %s excluded by devices file (checking PVID).",
-					  getpid(), dev_name(devl->dev));
+				log_print_pvscan(cmd, "%s excluded by devices file (checking PVID).",
+					         dev_name(devl->dev));
 				dm_list_del(&devl->list);
 				continue;
 			}
@@ -1576,8 +1627,8 @@ static int _pvscan_cache_args(struct cmd_context *cmd, int argc, char **argv,
 
 		/* Applies all filters, including those that need data from dev. */
 		if (!cmd->filter->passes_filter(cmd, cmd->filter, devl->dev, NULL)) {
-			log_print("pvscan[%d] %s excluded by filters: %s.", getpid(),
-				  dev_name(devl->dev), dev_filtered_reason(devl->dev));
+			log_print_pvscan(cmd, "%s excluded: %s.",
+					 dev_name(devl->dev), dev_filtered_reason(devl->dev));
 			dm_list_del(&devl->list);
 		}
 	}
@@ -1616,22 +1667,82 @@ static int _pvscan_cache_args(struct cmd_context *cmd, int argc, char **argv,
 	return ret;
 }
 
+static int _get_autoactivation(struct cmd_context *cmd, int event_activation, int *skip_command)
+{
+	const char *aa_str;
+
+	if (!(aa_str = arg_str_value(cmd, autoactivation_ARG, NULL)))
+		return 1;
+
+	if (strcmp(aa_str, "event")) {
+		log_print_pvscan(cmd, "Skip pvscan for unknown autoactivation value.");
+		*skip_command = 1;
+		return 1;
+	}
+	
+	if (!event_activation) {
+		log_print_pvscan(cmd, "Skip pvscan for event with event_activation=0.");
+		*skip_command = 1;
+		return 1;
+	}
+
+	return 1;
+}
+
 int pvscan_cache_cmd(struct cmd_context *cmd, int argc, char **argv)
 {
 	struct pvscan_aa_params pp = { 0 };
 	struct dm_list complete_vgnames;
 	int do_activate = arg_is_set(cmd, activate_ARG);
+	int event_activation;
+	int skip_command = 0;
 	int devno_args = 0;
 	int do_all;
 	int ret;
 
 	dm_list_init(&complete_vgnames);
 
-	if (do_activate &&
-	    !find_config_tree_bool(cmd, global_event_activation_CFG, NULL)) {
+	cmd->check_devs_used = 0;
+
+	cmd->print_device_id_not_found = 0;
+
+	cmd->ignore_device_name_mismatch = 1;
+
+	event_activation = find_config_tree_bool(cmd, global_event_activation_CFG, NULL);
+
+	if (do_activate && !event_activation) {
 		log_verbose("Ignoring pvscan --cache -aay because event_activation is disabled.");
 		return ECMD_PROCESSED;
 	}
+
+	/*
+	 * lvm udev rules call:
+	 *   pvscan --cache --listvg|--listlvs --checkcomplete PV
+	 * when PVs appear, even if event_activation=0 in lvm.conf.
+	 *
+	 * The udev rules will do autoactivation if they see complete
+	 * VGs/LVs reported from the pvscan.
+	 *
+	 * When event_activation=0 we do not want to do autoactivation
+	 * from udev events, so we need the pvscan to not report any
+	 * complete VGs/LVs when event_activation=0 so that the udev
+	 * rules do not attempt to autoactivate.
+	 */
+
+	if (arg_is_set(cmd, checkcomplete_ARG) && !event_activation) {
+		if (arg_is_set(cmd, udevoutput_ARG))
+			printf("LVM_EVENT_ACTIVATION=0\n");
+		else
+			log_print_pvscan(cmd, "Ignoring pvscan with --checkcomplete because event_activation is disabled.");
+		return ECMD_PROCESSED;
+	}
+
+	/*
+	 * Do not use udev for device listing or device info because pvscan
+	 * is used to populate udev info.
+	 */
+	init_obtain_device_list_from_udev(0);
+	init_external_device_info_source(DEV_EXT_NONE);
 
 	if (arg_is_set(cmd, major_ARG) + arg_is_set(cmd, minor_ARG))
 		devno_args = 1;
@@ -1643,12 +1754,24 @@ int pvscan_cache_cmd(struct cmd_context *cmd, int argc, char **argv)
 
 	do_all = !argc && !devno_args;
 
-	_online_dir_setup();
+	online_dir_setup(cmd);
 
 	if (do_all) {
 		if (!_pvscan_cache_all(cmd, argc, argv, &complete_vgnames))
 			return ECMD_FAILED;
 	} else {
+		if (!arg_is_set(cmd, checkcomplete_ARG) && !event_activation) {
+			/* Avoid doing anything for device removal: pvscan --cache <devno> */
+			log_verbose("Ignoring pvscan --cache because event_activation is disabled.");
+			return ECMD_PROCESSED;
+		}
+
+		if (!_get_autoactivation(cmd, event_activation, &skip_command))
+			return_ECMD_FAILED;
+
+		if (skip_command)
+			return ECMD_PROCESSED;
+
 		if (!_pvscan_cache_args(cmd, argc, argv, &complete_vgnames))
 			return ECMD_FAILED;
 	}

@@ -15,6 +15,11 @@
 #include "tools.h"
 #include "lib/cache/lvmcache.h"
 #include "lib/device/device_id.h"
+#include "lib/device/dev-type.h"
+#include "lib/filters/filter.h"
+
+/* coverity[unnecessary_header] needed for MuslC */
+#include <sys/file.h>
 
 static void _search_devs_for_pvids(struct cmd_context *cmd, struct dm_list *search_pvids, struct dm_list *found_devs)
 {
@@ -108,7 +113,7 @@ static void _search_devs_for_pvids(struct cmd_context *cmd, struct dm_list *sear
 		dev = devl->dev;
 		cmd->filter->wipe(cmd, cmd->filter, dev, NULL);
 		if (!cmd->filter->passes_filter(cmd, cmd->filter, dev, NULL)) {
-			log_warn("WARNING: PVID %s found on %s which is excluded by filter: %s",
+			log_warn("WARNING: PVID %s found on %s which is excluded: %s",
 			 	  dev->pvid, dev_name(dev), dev_filtered_reason(dev));
 			dm_list_del(&devl->list);
 		}
@@ -123,7 +128,7 @@ int lvmdevices(struct cmd_context *cmd, int argc, char **argv)
 	struct device_list *devl;
 	struct device *dev;
 	struct dev_use *du, *du2;
-	int changes = 0;
+	const char *deviceidtype;
 
 	dm_list_init(&search_pvids);
 	dm_list_init(&found_devs);
@@ -171,12 +176,19 @@ int lvmdevices(struct cmd_context *cmd, int argc, char **argv)
 		log_error("Failed to read the devices file.");
 		return ECMD_FAILED;
 	}
-	dev_cache_scan();
+
+	prepare_open_file_limit(cmd, dm_list_size(&cmd->use_devices));
+
+	dev_cache_scan(cmd);
 	device_ids_match(cmd);
 
 	if (arg_is_set(cmd, check_ARG) || arg_is_set(cmd, update_ARG)) {
+		int update_set = arg_is_set(cmd, update_ARG);
 		int search_count = 0;
+		int update_needed = 0;
 		int invalid = 0;
+
+		unlink_searched_devnames(cmd);
 
 		label_scan_setup_bcache();
 
@@ -217,6 +229,49 @@ int lvmdevices(struct cmd_context *cmd, int argc, char **argv)
 		 * run just above.
 		 */
 		device_ids_validate(cmd, NULL, &invalid, 1);
+		if (invalid)
+			update_needed = 1;
+
+		/*
+		 * Remove multipath components.
+		 * Add multipath devs that had components listed.
+		 */
+		dm_list_iterate_items_safe(du, du2, &cmd->use_devices) {
+			dev_t mpath_devno;
+			struct device *mpath_dev;
+
+			if (!du->dev)
+				continue;
+			dev = du->dev;
+
+			if (!(dev->filtered_flags & DEV_FILTERED_MPATH_COMPONENT))
+				continue;
+
+			/* redundant given the flag check, but used to get devno */
+			if (!dev_is_mpath_component(cmd, dev, &mpath_devno))
+				continue;
+
+			update_needed = 1;
+			if (update_set) {
+				log_print("Removing multipath component %s.", dev_name(du->dev));
+				dm_list_del(&du->list);
+			}
+
+			if (!(mpath_dev = dev_cache_get_by_devt(cmd, mpath_devno)))
+				continue;
+
+			if (!get_du_for_dev(cmd, mpath_dev)) {
+				if (update_set) {
+					log_print("Adding multipath device %s for multipath component %s.",
+						  dev_name(mpath_dev), dev_name(du->dev));
+					if (!device_id_add(cmd, mpath_dev, dev->pvid, NULL, NULL))
+						stack;
+				} else {
+					log_print("Missing multipath device %s for multipath component %s.",
+						  dev_name(mpath_dev), dev_name(du->dev));
+				}
+			}
+		}
 
 		/*
 		 * Find and fix any devname entries that have moved to a
@@ -232,32 +287,23 @@ int lvmdevices(struct cmd_context *cmd, int argc, char **argv)
 				label_scan_invalidate(du->dev);
 		}
 
-		/*
-		 * check du->part
-		 */
-		dm_list_iterate_items(du, &cmd->use_devices) {
-			int part = 0;
-			if (!du->dev)
-				continue;
-			dev = du->dev;
-
-			dev_get_partition_number(dev, &part);
-
-			if (part != du->part) {
-				log_warn("Device %s partition %u has incorrect PART in devices file (%u)",
-					 dev_name(dev), part, du->part);
-				du->part = part;
-				changes++;
-			}
-		}
-
 		if (arg_is_set(cmd, update_ARG)) {
-			if (invalid || !dm_list_empty(&found_devs)) {
+			if (update_needed || !dm_list_empty(&found_devs)) {
 				if (!device_ids_write(cmd))
 					goto_bad;
 				log_print("Updated devices file to version %s", devices_file_version());
 			} else {
 				log_print("No update for devices file is needed.");
+			}
+		} else {
+			/*
+			 * --check exits with an error if the devices file
+			 * needs updates, i.e. running --update would make
+			 * changes.
+			 */
+			if (update_needed) {
+				log_error("Updates needed for devices file.");
+				goto bad;
 			}
 		}
 		goto out;
@@ -265,7 +311,6 @@ int lvmdevices(struct cmd_context *cmd, int argc, char **argv)
 
 	if (arg_is_set(cmd, adddev_ARG)) {
 		const char *devname;
-		const char *deviceidtype;
 
 		if (!(devname = arg_str_value(cmd, adddev_ARG, NULL)))
 			goto_bad;
@@ -308,7 +353,7 @@ int lvmdevices(struct cmd_context *cmd, int argc, char **argv)
 		cmd->filter_deviceid_skip = 1;
 
 		if (!cmd->filter->passes_filter(cmd, cmd->filter, dev, NULL)) {
-			log_warn("WARNING: adding device %s that is excluded by filter: %s.",
+			log_warn("WARNING: adding device %s that is excluded: %s.",
 				 dev_name(dev), dev_filtered_reason(dev));
 		}
 
@@ -362,7 +407,8 @@ int lvmdevices(struct cmd_context *cmd, int argc, char **argv)
 			goto bad;
 		}
 		dm_list_iterate_items(devl, &found_devs) {
-			if (!device_id_add(cmd, devl->dev, devl->dev->pvid, NULL, NULL))
+			deviceidtype = arg_str_value(cmd, deviceidtype_ARG, NULL);
+			if (!device_id_add(cmd, devl->dev, devl->dev->pvid, deviceidtype, NULL))
 				goto_bad;
 		}
 		if (!device_ids_write(cmd))
@@ -370,36 +416,80 @@ int lvmdevices(struct cmd_context *cmd, int argc, char **argv)
 		goto out;
 	}
 
-	if (arg_is_set(cmd, deldev_ARG)) {
+	if (arg_is_set(cmd, deldev_ARG) && !arg_is_set(cmd, deviceidtype_ARG)) {
 		const char *devname;
 
 		if (!(devname = arg_str_value(cmd, deldev_ARG, NULL)))
 			goto_bad;
 
+		if (strncmp(devname, "/dev/", 5))
+			log_warn("WARNING: to remove a device by device id, include --deviceidtype.");
+
 		/*
 		 * No filter because we always want to allow removing a device
 		 * by name from the devices file.
 		 */
-		if (!(dev = dev_cache_get(cmd, devname, NULL))) {
-			log_error("No device found for %s.", devname);
-			goto bad;
+		if ((dev = dev_cache_get(cmd, devname, NULL))) {
+			/*
+			 * dev_cache_scan uses sysfs to check if an LV is using each dev
+			 * and sets this flag is so.
+			 */
+			if (dev_is_used_by_active_lv(cmd, dev, NULL, NULL, NULL, NULL)) {
+				if (!arg_count(cmd, yes_ARG) &&
+			    	    yes_no_prompt("Device %s is used by an active LV, continue to remove? ", devname) == 'n') {
+					log_error("Device not removed.");
+					goto bad;
+				}
+			}
+			if ((du = get_du_for_dev(cmd, dev)))
+				goto dev_del;
 		}
 
-		/*
-		 * dev_cache_scan uses sysfs to check if an LV is using each dev
-		 * and sets this flag is so.
-		 */
-		if (dev->flags & DEV_USED_FOR_LV) {
+		if (!(du = get_du_for_devname(cmd, devname))) {
+			log_error("No devices file entry for %s.", devname);
+			goto bad;
+		}
+ dev_del:
+		dm_list_del(&du->list);
+		free_du(du);
+		device_ids_write(cmd);
+		goto out;
+	}
+
+	/*
+	 * By itself, --deldev <devname> specifies a device name to remove.
+	 * With an id type specified, --deldev specifies a device id to remove:
+	 * --deldev <idname> --deviceidtype <idtype>
+	 */
+	if (arg_is_set(cmd, deldev_ARG) && arg_is_set(cmd, deviceidtype_ARG)) {
+		const char *idtype_str = arg_str_value(cmd, deviceidtype_ARG, NULL);
+		const char *idname = arg_str_value(cmd, deldev_ARG, NULL);
+		int idtype;
+
+		if (!idtype_str || !idname || !strlen(idname) || !strlen(idtype_str))
+			goto_bad;
+
+		if (!(idtype = idtype_from_str(idtype_str))) {
+			log_error("Unknown device_id type.");
+			goto_bad;
+		}
+
+		if (!strncmp(idname, "/dev/", 5))
+			log_warn("WARNING: to remove a device by name, do not include --deviceidtype.");
+
+		if (!(du = get_du_for_device_id(cmd, idtype, idname))) {
+			log_error("No devices file entry with device id %s %s.", idtype_str, idname);
+			goto_bad;
+		}
+
+		dev = du->dev;
+
+		if (dev && dev_is_used_by_active_lv(cmd, dev, NULL, NULL, NULL, NULL)) {
 			if (!arg_count(cmd, yes_ARG) &&
-			    yes_no_prompt("Device %s is used by an active LV, continue to remove? ", devname) == 'n') {
+			    yes_no_prompt("Device %s is used by an active LV, continue to remove? ", dev_name(dev)) == 'n') {
 				log_error("Device not removed.");
 				goto bad;
 			}
-		}
-
-		if (!(du = get_du_for_dev(cmd, dev))) {
-			log_error("Device not found in devices file.");
-			goto bad;
 		}
 
 		dm_list_del(&du->list);
@@ -435,7 +525,7 @@ int lvmdevices(struct cmd_context *cmd, int argc, char **argv)
 
 		if (du->devname && (du->devname[0] != '.')) {
 			if ((dev = dev_cache_get(cmd, du->devname, NULL)) &&
-			    (dev->flags & DEV_USED_FOR_LV)) {
+			    dev_is_used_by_active_lv(cmd, dev, NULL, NULL, NULL, NULL)) {
 				if (!arg_count(cmd, yes_ARG) &&
 			    	    yes_no_prompt("Device %s is used by an active LV, continue to remove? ", du->devname) == 'n') {
 					log_error("Device not removed.");
