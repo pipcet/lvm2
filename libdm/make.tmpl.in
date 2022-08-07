@@ -356,7 +356,7 @@ CLEAN_CFLOW += \
 
 ifneq ("$(CFLOW_CMD)", "")
 CFLOW_FLAGS +=\
- --cpp="$(CC) -E $(INCLUDES) $(VALGRIND_CFLAGS) $(BLKID_CFLAGS) $(DEFS) \
+ --cpp="$(CC) $(CFLAGS) -E $(INCLUDES) $(VALGRIND_CFLAGS) $(BLKID_CFLAGS) $(DEFS) \
  -I$(top_srcdir)/libdm/ioctl \
  -I$(top_srcdir)/libdm" \
  --symbol _ISbit:wrapper \
@@ -492,7 +492,7 @@ endif
 	$(Q) set -e; \
 	( cat $(srcdir)/.exported_symbols; \
 	  if test -n "$(EXPORTED_HEADER)"; then \
-		$(CC) -E -P $(INCLUDES) $(DEFS) $(EXPORTED_HEADER) | \
+		$(CC) $(CFLAGS) -E -P $(INCLUDES) $(DEFS) $(EXPORTED_HEADER) | \
 		$(SED) -ne "/^typedef|}/!s/.*[ *]\($(EXPORTED_FN_PREFIX)_[a-z0-9_]*\)(.*/\1/p"; \
 	  fi \
 	) > $@
